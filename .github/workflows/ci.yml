@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: go test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        go-version: [ '1.25.x' ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Go env
+        run: go env
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        if: matrix.os != 'ubuntu-latest'
+        run: go test ./... -count=1
+
+      - name: Test (with coverage)
+        if: matrix.os == 'ubuntu-latest'
+        run: go test ./... -count=1 -covermode=atomic -coverprofile=coverage.out
+
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest'
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          flags: framer
+          name: framer
+
+  # Runs tests on real runner CPU architectures that GitHub-hosted runners provide.
+  native-arch:
+    name: go test (native ${{ matrix.target.goos }}/${{ matrix.target.goarch }})
+    runs-on: ${{ matrix.target.runsOn }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { runsOn: ubuntu-latest,        goos: linux,   goarch: amd64 }
+          - { runsOn: windows-latest,       goos: windows, goarch: amd64 }
+          - { runsOn: macos-latest,         goos: darwin,  goarch: arm64 }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Go env
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+        run: go env GOOS GOARCH
+
+      - name: Test (native)
+        run: go test ./... -count=1
+
+  # Cross-compilation coverage for additional ports (compile only; no runners required).
+  cross-compile:
+    name: cross-compile (compile tests only)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux, goarch: 386 }
+          - { goos: linux, goarch: ppc64le }
+          - { goos: linux, goarch: s390x }
+          - { goos: linux, goarch: riscv64 }
+          - { goos: linux, goarch: mips64le }
+          - { goos: linux, goarch: mipsle }
+          - { goos: linux, goarch: mips }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: Compile test binaries (${{ matrix.target.goos }}/${{ matrix.target.goarch }})
+        shell: bash
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          go env GOOS GOARCH CGO_ENABLED
+
+          outdir="$(mktemp -d)"
+          ext=""
+          if [ "${GOOS}" = "windows" ]; then ext=".exe"; fi
+
+          # Build (compile only) each package's test binary for the target platform.
+          while IFS= read -r pkg; do
+            name="$(echo "${pkg}" | tr '/.' '__')"
+            go test -c "${pkg}" -o "${outdir}/${name}${ext}"
+          done < <(go list ./...)
