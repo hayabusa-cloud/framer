@@ -201,6 +201,8 @@ Ningún método oculta bloqueo a menos que se configure explícitamente.
 
 Recomendación: en bucles no bloqueantes, prefiere `iox.CopyPolicy` con política de reintentos (p. ej., `PolicyRetry`) para manejar explícitamente `ErrWouldBlock` / `ErrMore`.
 
+**Nota sobre recuperación de escrituras parciales:** Al usar `iox.Copy` con destinos no bloqueantes, pueden ocurrir escrituras parciales. Si la fuente no implementa `io.Seeker`, `iox.Copy` devuelve `iox.ErrNoSeeker` para evitar pérdida silenciosa de datos. Para fuentes no buscables (p. ej., sockets de red), usa `iox.CopyPolicy` con `PolicyRetry` para errores semánticos del lado de escritura, asegurando que todos los bytes leídos se escriban antes de retornar.
+
 ## Reenvío
 
 - Proxy a nivel wire (motores de bytes): usa `iox.CopyPolicy` y fast paths estándar (`WriterTo`/`ReaderFrom`). Maximiza throughput cuando no necesitas preservar límites de nivel superior.

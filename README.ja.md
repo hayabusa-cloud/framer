@@ -201,6 +201,8 @@ fmt.Printf("got: %q\n", buf[:n])
 
 推奨：ノンブロッキングループでは、`ErrWouldBlock` / `ErrMore` を明示的に扱えるリトライポリシー付きの `iox.CopyPolicy`（例：`PolicyRetry`）を使ってください。
 
+**部分書き込みの回復に関する注意：** ノンブロッキングな宛先に対して `iox.Copy` を使用すると、部分書き込みが発生する可能性があります。ソースが `io.Seeker` を実装していない場合、`iox.Copy` はデータの暗黙的な損失を防ぐために `iox.ErrNoSeeker` を返します。シーク不可能なソース（例：ネットワークソケット）の場合は、書き込み側のセマンティックエラーに対して `PolicyRetry` を設定した `iox.CopyPolicy` を使用し、読み取ったすべてのバイトが返却前に書き込まれることを保証してください。
+
 ## Forwarding
 
 - ワイヤレベルのプロキシ（byte engines）：`iox.CopyPolicy` と標準 `io` の fast path（`WriterTo`/`ReaderFrom`）を使用。高いスループットが必要で境界保持が不要な場合に適します。

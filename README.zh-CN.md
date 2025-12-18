@@ -201,6 +201,8 @@ fmt.Printf("got: %q\n", buf[:n])
 
 建议：在非阻塞循环中，优先使用带重试策略的 `iox.CopyPolicy`（例如 `PolicyRetry`），以显式处理 `ErrWouldBlock` / `ErrMore`。
 
+**关于部分写入恢复的说明：** 当使用 `iox.Copy` 向非阻塞目标复制时，可能会发生部分写入。如果源不实现 `io.Seeker`，`iox.Copy` 会返回 `iox.ErrNoSeeker` 以防止静默数据丢失。对于不可寻址的源（如网络套接字），请使用 `iox.CopyPolicy` 并为写入端语义错误配置 `PolicyRetry`，以确保所有已读字节在返回前被写入。
+
 ## 转发
 
 - 线级代理（byte engines）：使用 `iox.CopyPolicy` 以及标准 `io` 快路径（`WriterTo`/`ReaderFrom`）。当你不需要保留更高层的边界语义时，这通常能获得更高吞吐。

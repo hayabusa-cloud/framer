@@ -201,6 +201,8 @@ Aucune méthode ne masque un blocage sans configuration explicite.
 
 Recommandation : dans les boucles non bloquantes, préférez `iox.CopyPolicy` avec une politique de retry (ex. `PolicyRetry`) pour traiter explicitement `ErrWouldBlock` / `ErrMore`.
 
+**Note sur la récupération des écritures partielles :** Lors de l'utilisation de `iox.Copy` avec des destinations non bloquantes, des écritures partielles peuvent survenir. Si la source n'implémente pas `io.Seeker`, `iox.Copy` retourne `iox.ErrNoSeeker` pour éviter une perte silencieuse de données. Pour les sources non repositionnables (ex. sockets réseau), utilisez `iox.CopyPolicy` avec `PolicyRetry` pour les erreurs sémantiques côté écriture, afin de garantir que tous les octets lus soient écrits avant le retour.
+
 ## Relais
 
 - Proxy wire (moteurs d’octets) : utilisez `iox.CopyPolicy` et les fast paths (`WriterTo`/`ReaderFrom`). Maximise le débit lorsque vous n’avez pas besoin de préserver des frontières de niveau supérieur.
