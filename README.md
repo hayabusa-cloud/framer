@@ -201,6 +201,8 @@ No method hides blocking unless explicitly configured.
 
 Recommendation: prefer `iox.CopyPolicy` with a retry-aware policy (e.g., `PolicyRetry`) in non-blocking loops so `ErrWouldBlock` / `ErrMore` are handled explicitly.
 
+**Note on partial write recovery:** When using `iox.Copy` with non-blocking destinations, partial writes may occur. If the source does not implement `io.Seeker`, `iox.Copy` returns `iox.ErrNoSeeker` to prevent silent data loss. For non-seekable sources (e.g., network sockets), use `iox.CopyPolicy` with `PolicyRetry` for write-side semantic errors to ensure all read bytes are written before returning.
+
 ## Forwarding
 
 - Wire proxying (byte engines): use `iox.CopyPolicy` and standard `io` fast paths (`WriterTo`/`ReaderFrom`). This maximizes throughput when you don't need to preserve higher-level boundaries.
