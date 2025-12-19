@@ -161,11 +161,13 @@ func (r *Reader) WriteTo(dst io.Writer) (int64, error) {
 			continue
 		}
 
+		// State-driven payload read loop. Pass the full buffer to readStream;
+		// readStream uses fr.offset internally to write to p[payloadOff:] where
+		// payloadOff = fr.offset - hdrSize. This ensures correct accumulation
+		// across ErrWouldBlock boundaries without losing progress.
 		need := int(fr.length)
-		got := 0
-		for got < need {
-			n, e := fr.read(fr.rbuf[got:need])
-			got += n
+		for {
+			_, e := fr.read(fr.rbuf[:need])
 			if e != nil {
 				if e == ErrWouldBlock || e == ErrMore {
 					return total, e
@@ -174,6 +176,12 @@ func (r *Reader) WriteTo(dst io.Writer) (int64, error) {
 					return total, io.ErrUnexpectedEOF
 				}
 				return total, e
+			}
+			// readStream calls fr.reset() on completion, so fr.offset becomes 0.
+			// Check if message is complete.
+			if fr.offset == 0 {
+				// Message complete, fr.reset() was called
+				break
 			}
 		}
 
