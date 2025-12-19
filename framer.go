@@ -167,7 +167,7 @@ func (r *Reader) WriteTo(dst io.Writer) (int64, error) {
 		// across ErrWouldBlock boundaries without losing progress.
 		need := int(fr.length)
 		for {
-			n, e := fr.read(fr.rbuf[:need])
+			_, e := fr.read(fr.rbuf[:need])
 			if e != nil {
 				if e == ErrWouldBlock || e == ErrMore {
 					return total, e
@@ -181,10 +181,6 @@ func (r *Reader) WriteTo(dst io.Writer) (int64, error) {
 			// Check if message is complete.
 			if fr.offset == 0 {
 				// Message complete, fr.reset() was called
-				break
-			}
-			if n == 0 {
-				// No progress made, avoid infinite loop
 				break
 			}
 		}
