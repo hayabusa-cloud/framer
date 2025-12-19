@@ -1468,3 +1468,257 @@ func TestWriter_ReadFrom_NonBlocking_Resume(t *testing.T) {
 		t.Fatalf("wire mismatch:\n  got:  %v\n  want: %v", dst.buf.Bytes(), expectedWire)
 	}
 }
+
+// --- Coverage improvement tests ---
+
+// TestReader_WriteTo_Stream_ZeroLengthMessagePath verifies that WriteTo correctly
+// handles zero-length messages by skipping the payload read/write phase.
+// This covers framer.go lines 152-157 and 160-162.
+func TestReader_WriteTo_Stream_ZeroLengthMessagePath(t *testing.T) {
+	// Wire: zero-length message (header 0x00), then 3-byte message "abc"
+	wire := []byte{0, 3, 'a', 'b', 'c'}
+	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP()).(*fr.Reader)
+
+	var dst bytes.Buffer
+	n, err := r.WriteTo(&dst)
+	if err != nil {
+		t.Fatalf("WriteTo: unexpected error: %v", err)
+	}
+	// Only the 3-byte message should be written (zero-length is skipped)
+	if n != 3 {
+		t.Fatalf("WriteTo: want n=3, got n=%d", n)
+	}
+	if dst.String() != "abc" {
+		t.Fatalf("WriteTo: want \"abc\", got %q", dst.String())
+	}
+}
+
+// TestWriter_ReadFrom_MediumLength_Resume verifies that ReadFrom correctly resumes
+// a medium-length message (254-65535 bytes) after ErrWouldBlock.
+// This covers framer.go lines 248-251 (medium header size calculation).
+func TestWriter_ReadFrom_MediumLength_Resume(t *testing.T) {
+	// Create a 300-byte payload (requires 3-byte header: 0xFE + 2-byte length)
+	payload := bytes.Repeat([]byte{'m'}, 300)
+
+	src := &twoChunkReader{chunks: [][]byte{payload}}
+
+	// Block after writing header (3 bytes) + 10 bytes of payload = 13 bytes
+	dst := &wouldBlockMidWriteWriter{limit: 13}
+
+	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
+
+	// First call: reads payload, starts writing, blocks mid-payload
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+	// n1 should be 10 (payload bytes written before block)
+	if n1 != 10 {
+		t.Fatalf("first ReadFrom: want n=10, got n=%d", n1)
+	}
+
+	// Second call: should resume writing the remaining payload
+	n2, err2 := w.ReadFrom(src)
+	if err2 != nil {
+		t.Fatalf("second ReadFrom: unexpected error: %v", err2)
+	}
+	// n2 should be 290 (remaining payload bytes)
+	if n2 != 290 {
+		t.Fatalf("second ReadFrom: want n=290, got n=%d", n2)
+	}
+
+	// Verify total wire length: 3-byte header + 300-byte payload = 303 bytes
+	if len(dst.buf.Bytes()) != 303 {
+		t.Fatalf("wire length: got %d, want 303", len(dst.buf.Bytes()))
+	}
+	// Verify header byte indicates medium-length encoding
+	if dst.buf.Bytes()[0] != 0xFE {
+		t.Fatalf("header byte: got 0x%02X, want 0xFE", dst.buf.Bytes()[0])
+	}
+	// Verify payload content at offset 3
+	if !bytes.Equal(dst.buf.Bytes()[3:], payload) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
+// TestWriter_ReadFrom_LargeLength_Resume verifies that ReadFrom correctly resumes
+// a large-length message (>65535 bytes) after ErrWouldBlock.
+// This covers framer.go lines 251-253 (large header size calculation).
+//
+// Note: ReadFrom uses an internal 32KB buffer, so we test with Write directly
+// to ensure the large header path is exercised.
+func TestWriter_ReadFrom_LargeLength_Resume(t *testing.T) {
+	// Create a 70000-byte payload (requires 8-byte header: 0xFF + 7-byte length)
+	payload := bytes.Repeat([]byte{'L'}, 70000)
+
+	// Block after writing header (8 bytes) + 100 bytes of payload = 108 bytes
+	dst := &wouldBlockMidWriteWriter{limit: 108}
+
+	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
+
+	// First call: starts writing, blocks mid-payload
+	n1, err1 := w.Write(payload)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first Write: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+	// n1 is the number of payload bytes written before block
+	// Header is 8 bytes, so payload bytes = 108 - 8 = 100
+	if n1 != 100 {
+		t.Fatalf("first Write: want n=100, got n=%d", n1)
+	}
+
+	// Second call: should resume writing the remaining payload
+	n2, err2 := w.Write(payload)
+	if err2 != nil {
+		t.Fatalf("second Write: unexpected error: %v", err2)
+	}
+	// n2 should be 69900 (remaining payload bytes: 70000 - 100)
+	if n2 != 69900 {
+		t.Fatalf("second Write: want n=69900, got n=%d", n2)
+	}
+
+	// Verify total wire length: 8-byte header + 70000-byte payload
+	if len(dst.buf.Bytes()) != 8+70000 {
+		t.Fatalf("wire length: got %d, want %d", len(dst.buf.Bytes()), 8+70000)
+	}
+	// Verify header byte indicates large-length encoding
+	if dst.buf.Bytes()[0] != 0xFF {
+		t.Fatalf("header byte: got 0x%02X, want 0xFF", dst.buf.Bytes()[0])
+	}
+}
+
+// persistentBlockWriter blocks on every write after the first successful writes.
+type persistentBlockWriter struct {
+	buf     bytes.Buffer
+	limit   int // bytes to write before blocking
+	written int // total bytes written
+}
+
+func (w *persistentBlockWriter) Write(p []byte) (int, error) {
+	if w.written >= w.limit {
+		return 0, iox.ErrWouldBlock
+	}
+	canWrite := w.limit - w.written
+	if canWrite > len(p) {
+		canWrite = len(p)
+	}
+	n, _ := w.buf.Write(p[:canWrite])
+	w.written += n
+	if w.written >= w.limit {
+		return n, iox.ErrWouldBlock
+	}
+	return n, nil
+}
+
+// TestWriter_ReadFrom_ResumeBlocksAgain verifies that ReadFrom correctly handles
+// multiple consecutive ErrWouldBlock returns during resume.
+// This covers framer.go lines 264-268 (ErrWouldBlock during resume).
+func TestWriter_ReadFrom_ResumeBlocksAgain(t *testing.T) {
+	payload := []byte("hello world!") // 12-byte message
+
+	src := &twoChunkReader{chunks: [][]byte{payload}}
+
+	// Block after writing header (1 byte) + 3 bytes = 4 bytes total
+	dst := &persistentBlockWriter{limit: 4}
+
+	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
+
+	// First call: writes header + 3 bytes payload, then blocks
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+	if n1 != 3 {
+		t.Fatalf("first ReadFrom: want n=3, got n=%d", n1)
+	}
+
+	// Second call: tries to resume but blocks immediately (limit reached)
+	dst.limit = 4 // still at limit
+	n2, err2 := w.ReadFrom(src)
+	if !errors.Is(err2, iox.ErrWouldBlock) {
+		t.Fatalf("second ReadFrom: want ErrWouldBlock, got (%d, %v)", n2, err2)
+	}
+	if n2 != 0 {
+		t.Fatalf("second ReadFrom: want n=0, got n=%d", n2)
+	}
+
+	// Third call: allow more writes
+	dst.limit = 100
+	n3, err3 := w.ReadFrom(src)
+	if err3 != nil {
+		t.Fatalf("third ReadFrom: unexpected error: %v", err3)
+	}
+	// n3 should be 9 (remaining payload bytes)
+	if n3 != 9 {
+		t.Fatalf("third ReadFrom: want n=9, got n=%d", n3)
+	}
+
+	// Verify wire format
+	expectedWire := append([]byte{12}, payload...)
+	if !bytes.Equal(dst.buf.Bytes(), expectedWire) {
+		t.Fatalf("wire mismatch:\n  got:  %v\n  want: %v", dst.buf.Bytes(), expectedWire)
+	}
+}
+
+// partialHeaderEOFReader returns a partial header byte then EOF.
+type partialHeaderEOFReader struct {
+	done bool
+}
+
+func (r *partialHeaderEOFReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	// Return nothing, then EOF on next call - but we need to return partial data
+	// Actually, we need to return some data then EOF on next call
+	return 0, io.EOF
+}
+
+// singleByteEOFReader returns one byte then EOF on the next call.
+type singleByteEOFReader struct {
+	b    byte
+	sent bool
+}
+
+func (r *singleByteEOFReader) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	if len(p) > 0 {
+		p[0] = r.b
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// TestReader_Read_PartialHeaderEOF verifies that Read returns io.ErrUnexpectedEOF
+// when EOF is received after reading a partial extended header.
+// This covers internal.go lines 182-186.
+func TestReader_Read_PartialHeaderEOF(t *testing.T) {
+	// Send header byte 0xFE (indicates 2-byte extended length follows) then EOF
+	// This should trigger the partial header EOF path
+	wire := []byte{0xFE} // header indicates extended length, but no length bytes follow
+	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP())
+
+	buf := make([]byte, 100)
+	n, err := r.Read(buf)
+	if n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("Read: want (0, ErrUnexpectedEOF), got (%d, %v)", n, err)
+	}
+}
+
+// TestReader_Read_PartialExtendedHeaderEOF verifies that Read returns io.ErrUnexpectedEOF
+// when EOF is received mid-extended-header (after reading some but not all extended bytes).
+func TestReader_Read_PartialExtendedHeaderEOF(t *testing.T) {
+	// Send header byte 0xFE + 1 byte of extended length (need 2), then EOF
+	wire := []byte{0xFE, 0x00} // header + partial extended length
+	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP())
+
+	buf := make([]byte, 100)
+	n, err := r.Read(buf)
+	if n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("Read: want (0, ErrUnexpectedEOF), got (%d, %v)", n, err)
+	}
+}
