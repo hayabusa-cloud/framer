@@ -146,7 +146,9 @@ func (f *Forwarder) ForwardOnce() (n int, err error) {
 				max = int(f.rr.readLimit)
 			}
 			// Attempt a single read; may be short if underlying is non-blocking.
-			rn, re := f.rr.read(f.buf[:max])
+			// Use f.buf[f.got:max] to correctly accumulate partial reads across
+			// ErrWouldBlock boundaries without overwriting already-read data.
+			rn, re := f.rr.read(f.buf[f.got:max])
 			f.got += rn
 			if re != nil {
 				switch re {
