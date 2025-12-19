@@ -257,6 +257,11 @@ func (w *Writer) ReadFrom(src io.Reader) (int64, error) {
 				// Resume the in-flight write using the buffered data.
 				// fr.length holds the payload length from the previous call.
 				chunkLen := int(fr.length)
+				// Guard: if the in-flight message is larger than the internal buffer,
+				// it was started by Write (not ReadFrom) and cannot be resumed here.
+				if chunkLen > len(buf) {
+					return total, io.ErrShortBuffer
+				}
 				wn, we := fr.write(buf[:chunkLen])
 				if wn > 0 {
 					total += int64(wn)
