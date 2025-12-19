@@ -1722,3 +1722,84 @@ func TestReader_Read_PartialExtendedHeaderEOF(t *testing.T) {
 		t.Fatalf("Read: want (0, ErrUnexpectedEOF), got (%d, %v)", n, err)
 	}
 }
+
+// TestWriter_ReadFrom_LargeMessageResumeGuard verifies that ReadFrom returns
+// io.ErrShortBuffer when trying to resume a large message (>32KB) that was
+// started by Write. This covers the defensive guard at framer.go lines 262-263.
+func TestWriter_ReadFrom_LargeMessageResumeGuard(t *testing.T) {
+	// Create a 70000-byte payload (requires 8-byte header, >32KB buffer)
+	payload := bytes.Repeat([]byte{'L'}, 70000)
+
+	// Block after writing header (8 bytes) + 100 bytes of payload
+	dst := &wouldBlockMidWriteWriter{limit: 108}
+
+	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
+
+	// First call via Write: starts writing large message, blocks mid-payload
+	n1, err1 := w.Write(payload)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("Write: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+
+	// Second call via ReadFrom: should return ErrShortBuffer because the
+	// in-flight message (70000 bytes) exceeds the internal 32KB buffer.
+	src := bytes.NewReader(nil)
+	n2, err2 := w.ReadFrom(src)
+	if !errors.Is(err2, io.ErrShortBuffer) {
+		t.Fatalf("ReadFrom: want ErrShortBuffer, got (%d, %v)", n2, err2)
+	}
+}
+
+// errorAfterProgressWriter writes some bytes successfully, then returns an error.
+type errorAfterProgressWriter struct {
+	buf     bytes.Buffer
+	limit   int   // bytes to write before returning error
+	written int   // total bytes written
+	err     error // error to return after limit
+}
+
+func (w *errorAfterProgressWriter) Write(p []byte) (int, error) {
+	if w.written >= w.limit {
+		return 0, w.err
+	}
+	canWrite := w.limit - w.written
+	if canWrite > len(p) {
+		canWrite = len(p)
+	}
+	n, _ := w.buf.Write(p[:canWrite])
+	w.written += n
+	if w.written >= w.limit {
+		return n, w.err
+	}
+	return n, nil
+}
+
+// TestWriter_ReadFrom_ResumeNonSemanticError verifies that ReadFrom correctly
+// propagates non-semantic errors (not ErrWouldBlock/ErrMore) during resume.
+// This covers framer.go line 273.
+func TestWriter_ReadFrom_ResumeNonSemanticError(t *testing.T) {
+	payload := []byte("hello world!") // 12-byte message
+
+	customErr := errors.New("custom write error")
+
+	// First write: blocks after header (1 byte) + 3 bytes payload = 4 bytes
+	dst := &errorAfterProgressWriter{limit: 4, err: iox.ErrWouldBlock}
+
+	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
+
+	// First call: writes header + 3 bytes payload, then blocks
+	src := &twoChunkReader{chunks: [][]byte{payload}}
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+
+	// Change the error to a custom error for the resume
+	dst.err = customErr
+
+	// Second call: tries to resume but gets custom error
+	n2, err2 := w.ReadFrom(bytes.NewReader(nil))
+	if !errors.Is(err2, customErr) {
+		t.Fatalf("second ReadFrom: want customErr, got (%d, %v)", n2, err2)
+	}
+}
