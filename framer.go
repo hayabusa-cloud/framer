@@ -223,6 +223,10 @@ func (w *Writer) Write(p []byte) (int, error) { return w.fr.write(p) }
 // Non-blocking semantics: if src.Read or the underlying writer returns iox.ErrWouldBlock
 // or iox.ErrMore, ReadFrom returns immediately with the progress count and the same error.
 // No heap allocations in the steady-state path.
+//
+// Resume semantics: if a previous call returned ErrWouldBlock mid-write, the next call
+// resumes the in-flight message using the persistent framer state (fr.offset, fr.length)
+// before reading new data from src.
 func (w *Writer) ReadFrom(src io.Reader) (int64, error) {
 	fr := w.fr
 	// Reuse a per-framer buffer to guarantee zero allocs/op.
@@ -233,6 +237,44 @@ func (w *Writer) ReadFrom(src io.Reader) (int64, error) {
 
 	var total int64
 	for {
+		// Check for in-flight write from a previous ErrWouldBlock.
+		// writeStream sets fr.length on the first call and uses fr.offset to track
+		// progress. If fr.offset > 0 and fr.length > 0, we have a partial write to resume.
+		// We must also verify the write is actually incomplete by checking offset < totalSize.
+		if fr.offset > 0 && fr.length > 0 {
+			// Calculate expected total frame size to verify write is incomplete.
+			// Header size depends on payload length.
+			var hdrSize int64 = 1 // frameHeaderLen
+			if fr.length > 253 {  // framePayloadMaxLen8Bits
+				if fr.length <= 65535 { // framePayloadMaxLen16
+					hdrSize += 2
+				} else {
+					hdrSize += 7
+				}
+			}
+			totalSize := hdrSize + fr.length
+			if fr.offset < totalSize {
+				// Resume the in-flight write using the buffered data.
+				// fr.length holds the payload length from the previous call.
+				chunkLen := int(fr.length)
+				wn, we := fr.write(buf[:chunkLen])
+				if wn > 0 {
+					total += int64(wn)
+				}
+				if we != nil {
+					if we == ErrWouldBlock || we == ErrMore {
+						return total, we
+					}
+					return total, we
+				}
+				// In-flight write completed; continue to read next chunk.
+				continue
+			}
+			// offset >= totalSize means write was already complete but not reset.
+			// Fall through to read new data, which will trigger io.ErrShortWrite
+			// in writeStream due to length mismatch.
+		}
+
 		n, er := src.Read(buf)
 		if n > 0 {
 			// Encode this chunk as one framed message.

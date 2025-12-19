@@ -1304,3 +1304,167 @@ func TestRead_AfterPartialWriteTo_Interleaving(t *testing.T) {
 		t.Fatalf("Read payload at offset mismatch:\n  got:  %q\n  want: %q", buf[3:10], expected)
 	}
 }
+
+// partialPacketReader returns partial data with ErrWouldBlock to simulate
+// a non-blocking socket that would block mid-packet. It returns (n, ErrWouldBlock)
+// in a single call to test proper accumulation of partial reads.
+type partialPacketReader struct {
+	data       []byte
+	off        int
+	blockAfter int  // return (blockAfter bytes, ErrWouldBlock) on first read
+	blocked    bool // whether we've returned ErrWouldBlock
+}
+
+func (r *partialPacketReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+
+	// On first read, return partial data WITH ErrWouldBlock in the same call.
+	// This simulates a non-blocking socket returning partial data before blocking.
+	if !r.blocked {
+		r.blocked = true
+		toReturn := r.blockAfter
+		if toReturn > len(p) {
+			toReturn = len(p)
+		}
+		if toReturn > len(r.data)-r.off {
+			toReturn = len(r.data) - r.off
+		}
+		n := copy(p, r.data[r.off:r.off+toReturn])
+		r.off += n
+		return n, iox.ErrWouldBlock
+	}
+
+	// Subsequent reads return remaining data normally
+	remaining := len(r.data) - r.off
+	toReturn := len(p)
+	if toReturn > remaining {
+		toReturn = remaining
+	}
+
+	n := copy(p, r.data[r.off:r.off+toReturn])
+	r.off += n
+	return n, nil
+}
+
+// TestForward_SeqPacket_PartialReadAccumulation verifies that Forwarder correctly
+// accumulates partial packet reads when ErrWouldBlock is returned with progress.
+// This is a regression test for a bug where the buffer was overwritten on retry
+// instead of appending at the correct position.
+func TestForward_SeqPacket_PartialReadAccumulation(t *testing.T) {
+	payload := []byte("0123456789") // 10-byte packet
+
+	// Return first 3 bytes with ErrWouldBlock, then remaining 7 bytes
+	src := &partialPacketReader{data: payload, blockAfter: 3}
+	var dst bytes.Buffer
+	fwd := fr.NewForwarder(&dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	// First call: reads 3 bytes with ErrWouldBlock (read phase)
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first ForwardOnce: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+	if n1 != 3 {
+		t.Fatalf("first ForwardOnce: want n=3 (read progress), got n=%d", n1)
+	}
+
+	// Second call: reads remaining 7 bytes, then writes full 10-byte packet (write phase)
+	n2, err2 := fwd.ForwardOnce()
+	if err2 != nil {
+		t.Fatalf("second ForwardOnce: unexpected error: %v", err2)
+	}
+	// n2 is the write phase progress: 10 bytes written to dst
+	if n2 != 10 {
+		t.Fatalf("second ForwardOnce: want n=10 (write progress), got n=%d", n2)
+	}
+
+	// Verify the output matches the original payload
+	if !bytes.Equal(dst.Bytes(), payload) {
+		t.Fatalf("payload mismatch:\n  got:  %q\n  want: %q", dst.Bytes(), payload)
+	}
+}
+
+// wouldBlockMidWriteWriter returns ErrWouldBlock after writing a limited number of bytes.
+type wouldBlockMidWriteWriter struct {
+	buf     bytes.Buffer
+	limit   int  // bytes to write before returning ErrWouldBlock
+	written int  // total bytes written so far
+	blocked bool // whether we've returned ErrWouldBlock
+}
+
+func (w *wouldBlockMidWriteWriter) Write(p []byte) (int, error) {
+	if !w.blocked && w.written+len(p) > w.limit {
+		// Write up to limit, then return ErrWouldBlock
+		canWrite := w.limit - w.written
+		if canWrite > 0 {
+			n, _ := w.buf.Write(p[:canWrite])
+			w.written += n
+			w.blocked = true
+			return n, iox.ErrWouldBlock
+		}
+		w.blocked = true
+		return 0, iox.ErrWouldBlock
+	}
+	n, err := w.buf.Write(p)
+	w.written += n
+	return n, err
+}
+
+// twoChunkReader returns two chunks: first chunk, then second chunk.
+type twoChunkReader struct {
+	chunks [][]byte
+	idx    int
+}
+
+func (r *twoChunkReader) Read(p []byte) (int, error) {
+	if r.idx >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.idx])
+	r.idx++
+	return n, nil
+}
+
+// TestWriter_ReadFrom_NonBlocking_Resume verifies that Writer.ReadFrom correctly
+// resumes after ErrWouldBlock is returned mid-message. This is a regression test
+// for a bug where the next call to ReadFrom would read a new chunk from src,
+// losing the in-flight data.
+func TestWriter_ReadFrom_NonBlocking_Resume(t *testing.T) {
+	chunk1 := []byte("hello") // 5-byte message
+
+	// Source provides one chunk
+	src := &twoChunkReader{chunks: [][]byte{chunk1}}
+
+	// Destination blocks after writing header (1 byte) + 2 bytes of payload
+	dst := &wouldBlockMidWriteWriter{limit: 3}
+
+	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
+
+	// First call: reads chunk1, starts writing framed message, blocks mid-payload
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+	// n1 should be 2 (payload bytes written before block)
+	if n1 != 2 {
+		t.Fatalf("first ReadFrom: want n=2, got n=%d", n1)
+	}
+
+	// Second call: should resume writing the remaining payload
+	n2, err2 := w.ReadFrom(src)
+	// Should complete with EOF (src exhausted)
+	if err2 != nil {
+		t.Fatalf("second ReadFrom: unexpected error: %v", err2)
+	}
+	// n2 should be 3 (remaining payload bytes)
+	if n2 != 3 {
+		t.Fatalf("second ReadFrom: want n=3, got n=%d", n2)
+	}
+
+	// Verify the wire format: header (1 byte with length 5) + payload "hello"
+	expectedWire := append([]byte{5}, chunk1...)
+	if !bytes.Equal(dst.buf.Bytes(), expectedWire) {
+		t.Fatalf("wire mismatch:\n  got:  %v\n  want: %v", dst.buf.Bytes(), expectedWire)
+	}
+}
