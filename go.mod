@@ -1,5 +1,5 @@
 module code.hybscloud.com/framer
 
-go 1.25
+go 1.26
 
-require code.hybscloud.com/iox v0.2.1
+require code.hybscloud.com/iox v0.3.3
