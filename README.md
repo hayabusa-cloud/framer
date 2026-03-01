@@ -9,17 +9,15 @@
 
 Portable message framing for Go. Preserve one-message-per-Read/Write over stream transports.
 
-Scope: `framer` solves message boundary preservation across stream transports.
+Scope: message boundary preservation for stream transports.
 
-## At a glance
-
-- Solve message boundary problems for byte streams (TCP, Unix stream, pipes).
-- Pass-through on boundary-preserving transports (UDP, Unix datagram, WebSocket, SCTP).
-- Portable wire format; configurable byte order.
-
-## Why
+## Overview
 
 Many transports are byte streams (TCP, Unix stream, pipes). A single `Read` may return a partial application message, or several messages concatenated. `framer` restores message boundaries: in stream mode, one `Read` returns exactly one message payload, and one `Write` emits exactly one framed message.
+
+- Message boundary preservation for byte streams (TCP, Unix stream, pipes).
+- Pass-through on boundary-preserving transports (UDP, Unix datagram, WebSocket, SCTP).
+- Portable wire format; configurable byte order.
 
 ## Protocol adaptation
 
@@ -49,7 +47,7 @@ Limits and errors:
 - The maximum supported payload length is `2^56-1`; larger values result in `framer.ErrTooLong`.
 - When a read‑side limit is configured (`WithReadLimit`), lengths exceeding the limit fail with `framer.ErrTooLong`.
 
-## Quick start
+## Installation
 
 Install with `go get`:
 ```shell
@@ -72,6 +70,29 @@ if err != nil {
     panic(err)
 }
 fmt.Printf("got: %q\n", buf[:n])
+```
+
+## Non-blocking usage
+
+`framer` defaults to non-blocking mode. In an event-driven loop:
+
+```go
+for {
+    n, err := r.Read(buf)
+    if n > 0 {
+        process(buf[:n])
+    }
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            // No data now; wait for readability (epoll, io_uring, etc.)
+            continue
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
 ```
 
 ## Options
@@ -185,6 +206,8 @@ By default, framer is **non-blocking** (`WithNonblock()`): `ErrWouldBlock` is re
 
 No method hides blocking unless explicitly configured.
 
+`framer` uses `code.hybscloud.com/iox` control flow signals. `ErrWouldBlock` and `ErrMore` are aliases from `iox`, enabling direct integration with other `iox`-aware components (`iofd`, `takt`).
+
 ## Fast paths
 
 `framer` implements stdlib copy fast paths to interoperate with `io.Copy`-style engines and `iox.CopyPolicy`:
@@ -201,6 +224,8 @@ No method hides blocking unless explicitly configured.
 
 Recommendation: prefer `iox.CopyPolicy` with a retry-aware policy (e.g., `PolicyRetry`) in non-blocking loops so `ErrWouldBlock` / `ErrMore` are handled explicitly.
 
+**Zero-allocation steady state**: After initial buffer allocation, `Forwarder` and `WriteTo` paths reuse internal buffers. No heap allocations occur per message in steady state.
+
 **Note on partial write recovery:** When using `iox.Copy` with non-blocking destinations, partial writes may occur. If the source does not implement `io.Seeker`, `iox.Copy` returns `iox.ErrNoSeeker` to prevent silent data loss. For non-seekable sources (e.g., network sockets), use `iox.CopyPolicy` with `PolicyRetry` for write-side semantic errors to ensure all read bytes are written before returning.
 
 ## Forwarding
@@ -211,6 +236,27 @@ Recommendation: prefer `iox.CopyPolicy` with a retry-aware policy (e.g., `Policy
   - Limits: `io.ErrShortBuffer` when the internal buffer is too small for the message; `framer.ErrTooLong` when a message exceeds the configured `WithReadLimit`.
   - Zero‑alloc steady state after construction; the internal scratch buffer is reused per message.
 
+Message relay example:
+
+```go
+fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+
+for {
+    _, err := fwd.ForwardOnce()
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            continue // wait for src readable or dst writable
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
+
 ## License
 
-MIT — see `LICENSE`.
+MIT — see [LICENSE](LICENSE).
+
+©2025 [Hayabusa Cloud Co., Ltd.](https://code.hybscloud.com)

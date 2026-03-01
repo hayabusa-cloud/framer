@@ -9,17 +9,15 @@
 
 Framing de mensajes portable para Go. Conserva “un mensaje por `Read`/`Write`” sobre transportes tipo stream.
 
-Alcance: `framer` resuelve la preservación de límites de mensaje en transportes de flujo.
+Alcance: preservación de límites de mensaje en transportes de flujo.
 
-## En resumen
-
-- Resuelve problemas de límites de mensaje en flujos de bytes (TCP, Unix stream, pipes).
-- Pass-through en transportes que ya preservan límites (UDP, Unix datagram, WebSocket, SCTP).
-- Formato wire portable; orden de bytes configurable.
-
-## Por qué
+## Descripción general
 
 Muchos transportes son flujos de bytes (TCP, Unix stream, pipes). Un solo `Read` puede devolver una fracción de un mensaje de aplicación, o varios mensajes concatenados. `framer` restaura los límites: en modo stream, un `Read` devuelve exactamente un payload de mensaje y un `Write` emite exactamente un mensaje enmarcado.
+
+- Preservación de límites de mensaje en flujos de bytes (TCP, Unix stream, pipes).
+- Pass-through en transportes que ya preservan límites (UDP, Unix datagram, WebSocket, SCTP).
+- Formato wire portable; orden de bytes configurable.
 
 ## Adaptación de protocolo
 
@@ -49,7 +47,7 @@ Límites y errores:
 - La longitud máxima de payload soportada es `2^56-1`; valores mayores producen `framer.ErrTooLong`.
 - Con un límite de lectura (`WithReadLimit`), longitudes mayores fallan con `framer.ErrTooLong`.
 
-## Inicio rápido
+## Instalación
 
 Instala con `go get`:
 ```shell
@@ -74,7 +72,28 @@ if err != nil {
 fmt.Printf("got: %q\n", buf[:n])
 ```
 
-## Options
+## Uso no bloqueante
+
+`framer` opera en modo no bloqueante por defecto. En un bucle orientado a eventos:
+
+```go
+for {
+    n, err := r.Read(buf)
+    if n > 0 {
+        process(buf[:n])
+    }
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            // Sin datos ahora; esperar disponibilidad de lectura (epoll, io_uring, etc.)
+            continue
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
 
 - `WithProtocol(proto Protocol)` — elige `BinaryStream`, `SeqPacket` o `Datagram` (hay variantes de lectura/escritura).
 - Orden de bytes: `WithByteOrder`, o `WithReadByteOrder` / `WithWriteByteOrder`.
@@ -185,6 +204,8 @@ Por defecto, framer es **no bloqueante** (`WithNonblock()`): devuelve `ErrWouldB
 
 Ningún método oculta bloqueo a menos que se configure explícitamente.
 
+`framer` utiliza las señales de control de flujo de `code.hybscloud.com/iox`. `ErrWouldBlock` y `ErrMore` son alias de `iox`, lo que permite la integración directa con otros componentes compatibles con `iox` (`iofd`, `takt`).
+
 ## Fast paths
 
 `framer` implementa fast paths del stdlib para interoperar con motores tipo `io.Copy` y con `iox.CopyPolicy`:
@@ -201,6 +222,8 @@ Ningún método oculta bloqueo a menos que se configure explícitamente.
 
 Recomendación: en bucles no bloqueantes, prefiere `iox.CopyPolicy` con política de reintentos (p. ej., `PolicyRetry`) para manejar explícitamente `ErrWouldBlock` / `ErrMore`.
 
+**Cero asignaciones en steady-state**: Tras la asignación inicial del buffer, los paths de `Forwarder` y `WriteTo` reutilizan los buffers internos. No se producen asignaciones en el heap por mensaje en steady-state.
+
 **Nota sobre recuperación de escrituras parciales:** Al usar `iox.Copy` con destinos no bloqueantes, pueden ocurrir escrituras parciales. Si la fuente no implementa `io.Seeker`, `iox.Copy` devuelve `iox.ErrNoSeeker` para evitar pérdida silenciosa de datos. Para fuentes no buscables (p. ej., sockets de red), usa `iox.CopyPolicy` con `PolicyRetry` para errores semánticos del lado de escritura, asegurando que todos los bytes leídos se escriban antes de retornar.
 
 ## Reenvío
@@ -211,6 +234,27 @@ Recomendación: en bucles no bloqueantes, prefiere `iox.CopyPolicy` con polític
   - Límites: `io.ErrShortBuffer` si el buffer interno es insuficiente; `framer.ErrTooLong` si excede `WithReadLimit`.
   - Cero asignaciones en steady-state tras la construcción; el buffer interno se reutiliza.
 
+Ejemplo de relay por mensaje:
+
+```go
+fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+
+for {
+    _, err := fwd.ForwardOnce()
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            continue // esperar src legible o dst escribible
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
+
 ## Licencia
 
-MIT — ver `LICENSE`.
+MIT — ver [LICENSE](LICENSE).
+
+©2025 [Hayabusa Cloud Co., Ltd.](https://code.hybscloud.com)

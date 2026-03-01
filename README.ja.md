@@ -9,17 +9,15 @@
 
 Go 向けのポータブルなメッセージ・フレーミング。ストリーム系トランスポート上で「1 回の `Read` / `Write` = 1 メッセージ」を保ちます。
 
-スコープ：`framer` はストリーム系トランスポートにおけるメッセージ境界の問題を解決します。
+スコープ：ストリーム系トランスポートにおけるメッセージ境界の保持。
 
 ## 概要
 
-- バイトストリーム（TCP、Unix stream、pipe）のメッセージ境界問題を解決。
+多くのトランスポートはバイトストリームです（TCP、Unix stream、pipe）。単一の `Read` がアプリケーションメッセージの一部だけを返したり、複数メッセージを結合して返したりします。`framer` は境界を復元します。stream モードでは、1 回の `Read` がちょうど 1 つの payload を返し、1 回の `Write` がちょうど 1 つの（長さ前置き付き）メッセージを送ります。
+
+- バイトストリーム（TCP、Unix stream、pipe）のメッセージ境界保持。
 - 境界を保持するトランスポート（UDP、Unix datagram、WebSocket、SCTP）ではパススルー。
 - ポータブルなワイヤ形式；バイトオーダは設定可能。
-
-## なぜ
-
-多くのトランスポートはバイトストリームです（TCP、Unix stream、pipe）。単一の `Read` がアプリケーションメッセージの一部だけを返したり、複数メッセージを結合して返したりします。`framer` は境界を復元します。stream モードでは、1 回の `Read` がちょうど 1 つの payload を返し、1 回の `Write` がちょうど 1 つの（長さ前置き付き）メッセージを送ります。
 
 ## プロトコル適応
 
@@ -49,7 +47,7 @@ Go 向けのポータブルなメッセージ・フレーミング。ストリ�
 - 最大 payload 長は `2^56-1`。超える場合は `framer.ErrTooLong`。
 - 読み側に `WithReadLimit` を設定した場合、制限を超える長さは `framer.ErrTooLong`。
 
-## クイックスタート
+## インストール
 
 `go get` でインストール：
 ```shell
@@ -74,7 +72,28 @@ if err != nil {
 fmt.Printf("got: %q\n", buf[:n])
 ```
 
-## Options
+## ノンブロッキングの使用例
+
+`framer` の既定はノンブロッキングモードです。イベント駆動ループでの使い方：
+
+```go
+for {
+    n, err := r.Read(buf)
+    if n > 0 {
+        process(buf[:n])
+    }
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            // データなし；読み取り可能になるまで待つ（epoll、io_uring 等）
+            continue
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
 
 - `WithProtocol(proto Protocol)` — `BinaryStream` / `SeqPacket` / `Datagram` を選択（読み/書き方向別もあり）。
 - バイトオーダ：`WithByteOrder`、または `WithReadByteOrder` / `WithWriteByteOrder`。
@@ -185,6 +204,8 @@ fmt.Printf("got: %q\n", buf[:n])
 
 明示的に設定しない限り、隠れたブロッキングは行いません。
 
+`framer` は `code.hybscloud.com/iox` の制御フローシグナルを使用します。`ErrWouldBlock` と `ErrMore` は `iox` のエイリアスであり、他の `iox` 対応コンポーネント（`iofd`、`takt`）との直接統合が可能です。
+
 ## Fast paths
 
 `framer` は標準ライブラリのコピー最適化パスを実装し、`io.Copy` 系エンジンや `iox.CopyPolicy` と相互運用します：
@@ -201,6 +222,8 @@ fmt.Printf("got: %q\n", buf[:n])
 
 推奨：ノンブロッキングループでは、`ErrWouldBlock` / `ErrMore` を明示的に扱えるリトライポリシー付きの `iox.CopyPolicy`（例：`PolicyRetry`）を使ってください。
 
+**定常経路での割り当て 0**：初回のバッファ確保後、`Forwarder` と `WriteTo` パスは内部バッファを再利用します。定常状態ではメッセージあたりのヒープ割り当ては発生しません。
+
 **部分書き込みの回復に関する注意：** ノンブロッキングな宛先に対して `iox.Copy` を使用すると、部分書き込みが発生する可能性があります。ソースが `io.Seeker` を実装していない場合、`iox.Copy` はデータの暗黙的な損失を防ぐために `iox.ErrNoSeeker` を返します。シーク不可能なソース（例：ネットワークソケット）の場合は、書き込み側のセマンティックエラーに対して `PolicyRetry` を設定した `iox.CopyPolicy` を使用し、読み取ったすべてのバイトが返却前に書き込まれることを保証してください。
 
 ## Forwarding
@@ -211,6 +234,27 @@ fmt.Printf("got: %q\n", buf[:n])
   - 制限：内部バッファが不足なら `io.ErrShortBuffer`。`WithReadLimit` を超えるなら `framer.ErrTooLong`。
   - 構築後は定常経路での割り当て 0；内部バッファを再利用します。
 
+メッセージ中継の例：
+
+```go
+fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+
+for {
+    _, err := fwd.ForwardOnce()
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            continue // src の読み取り可能または dst の書き込み可能を待つ
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
+
 ## ライセンス
 
-MIT — `LICENSE` を参照。
+MIT — [LICENSE](LICENSE) を参照。
+
+©2025 [Hayabusa Cloud Co., Ltd.](https://code.hybscloud.com)
