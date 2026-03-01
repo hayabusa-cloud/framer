@@ -1147,6 +1147,40 @@ func TestReader_WriteTo_Stream_ConservativeCap_ErrTooLong(t *testing.T) {
 	}
 }
 
+// TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume verifies that
+// when dst.Write returns (n>0, ErrWouldBlock) — a partial write — the remaining
+// bytes are not lost and are delivered on the next WriteTo call.
+func TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume(t *testing.T) {
+	payload := []byte("ABCDEFGHIJ") // 10-byte payload
+	wire := append([]byte{byte(len(payload))}, payload...)
+
+	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+
+	// dst accepts only 4 bytes before returning ErrWouldBlock with partial progress.
+	dst := &fwWouldBlockWriter{limit: 4}
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first WriteTo: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+	if n1 != 4 {
+		t.Fatalf("first WriteTo: want n=4, got n=%d", n1)
+	}
+
+	// Raise the limit so the remaining 6 bytes can be written.
+	dst.limit = 10
+	n2, err2 := r.WriteTo(dst)
+	// The remaining 6 bytes should be written; then the reader hits EOF → nil.
+	if err2 != nil {
+		t.Fatalf("second WriteTo: unexpected error: %v", err2)
+	}
+	if n2 != 6 {
+		t.Fatalf("second WriteTo: want n=6, got n=%d", n2)
+	}
+	if n1+n2 != int64(len(payload)) {
+		t.Fatalf("total bytes: want %d, got %d", len(payload), n1+n2)
+	}
+}
+
 func TestReader_WriteTo_Stream_PropagatesNonSemanticError(t *testing.T) {
 	boom := errors.New("read error")
 	r := fr.NewReader(errReader{err: boom}, fr.WithReadTCP()).(*fr.Reader)
