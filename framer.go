@@ -127,6 +127,32 @@ func (r *Reader) WriteTo(dst io.Writer) (int64, error) {
 	}
 
 	for {
+		// Resume a partial dst.Write from a previous ErrWouldBlock/ErrMore.
+		if fr.wtLen > 0 {
+			for fr.wtOff < fr.wtLen {
+				wn, we := dst.Write(fr.rbuf[fr.wtOff:fr.wtLen])
+				if wn > 0 {
+					total += int64(wn)
+					fr.wtOff += wn
+				}
+				if we != nil {
+					if we == ErrWouldBlock || we == ErrMore {
+						return total, we
+					}
+					fr.wtOff = 0
+					fr.wtLen = 0
+					return total, we
+				}
+				if wn == 0 {
+					fr.wtOff = 0
+					fr.wtLen = 0
+					return total, io.ErrShortWrite
+				}
+			}
+			fr.wtOff = 0
+			fr.wtLen = 0
+		}
+
 		// Drive header parse with a zero-length read to establish fr.length.
 		// This may return io.ErrShortBuffer once the header is fully parsed and
 		// a non-zero payload length is known.
@@ -195,6 +221,10 @@ func (r *Reader) WriteTo(dst io.Writer) (int64, error) {
 			}
 			if we != nil {
 				if we == ErrWouldBlock || we == ErrMore {
+					// Save partial-write position so the next
+					// WriteTo call can resume without data loss.
+					fr.wtOff = off
+					fr.wtLen = need
 					return total, we
 				}
 				return total, we

@@ -38,6 +38,13 @@ type framer struct {
 	// reusable scratch buffer for Reader.WriteTo fast path
 	rbuf []byte
 
+	// WriteTo partial-write resume state: when dst.Write returns a
+	// partial result with ErrWouldBlock/ErrMore, wtOff..wtLen marks
+	// the unwritten region inside rbuf so the next WriteTo call can
+	// finish draining before reading a new message.
+	wtOff int
+	wtLen int
+
 	// reusable scratch buffer for Writer.ReadFrom fast path
 	wbuf []byte
 }
