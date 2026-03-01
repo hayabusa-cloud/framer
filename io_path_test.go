@@ -1208,6 +1208,49 @@ func TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume(t *testing.T) {
 	}
 }
 
+// TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_ResumeReblock verifies
+// that when the resume loop itself hits ErrWouldBlock again (double partial
+// write), the remaining bytes are still delivered on the third WriteTo call.
+func TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_ResumeReblock(t *testing.T) {
+	payload := []byte("ABCDEFGHIJ") // 10-byte payload
+	wire := append([]byte{byte(len(payload))}, payload...)
+
+	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+
+	// First call: dst accepts 4 bytes, then ErrWouldBlock.
+	dst := &capWouldBlockWriter{limit: 4}
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first WriteTo: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+	if n1 != 4 {
+		t.Fatalf("first WriteTo: want n=4, got n=%d", n1)
+	}
+
+	// Second call: raise limit to 7 so resume accepts 3 more bytes then blocks.
+	dst.limit = 7
+	n2, err2 := r.WriteTo(dst)
+	if !errors.Is(err2, iox.ErrWouldBlock) {
+		t.Fatalf("second WriteTo: want ErrWouldBlock, got (%d, %v)", n2, err2)
+	}
+	if n2 != 3 {
+		t.Fatalf("second WriteTo: want n=3, got n=%d", n2)
+	}
+
+	// Third call: raise limit to accept all remaining bytes.
+	dst.limit = 10
+	n3, err3 := r.WriteTo(dst)
+	if err3 != nil {
+		t.Fatalf("third WriteTo: unexpected error: %v", err3)
+	}
+	if n3 != 3 {
+		t.Fatalf("third WriteTo: want n=3, got n=%d", n3)
+	}
+	if got := dst.buf.Bytes(); !bytes.Equal(got, payload) {
+		t.Fatalf("content mismatch: got %q, want %q", got, payload)
+	}
+}
+
 // resumeErrWriter first accepts partial bytes with ErrWouldBlock, then on the
 // resume call returns a hard error after zero bytes.
 type resumeErrWriter struct {
