@@ -1147,9 +1147,34 @@ func TestReader_WriteTo_Stream_ConservativeCap_ErrTooLong(t *testing.T) {
 	}
 }
 
+// capWouldBlockWriter captures written bytes and returns ErrWouldBlock after
+// limit bytes have been accepted. Unlike fwWouldBlockWriter it records the
+// actual data so callers can assert content correctness.
+type capWouldBlockWriter struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (w *capWouldBlockWriter) Write(p []byte) (int, error) {
+	rem := w.limit - w.buf.Len()
+	if rem <= 0 {
+		return 0, iox.ErrWouldBlock
+	}
+	use := len(p)
+	if use > rem {
+		use = rem
+	}
+	n, _ := w.buf.Write(p[:use])
+	if use < len(p) {
+		return n, iox.ErrWouldBlock
+	}
+	return n, nil
+}
+
 // TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume verifies that
 // when dst.Write returns (n>0, ErrWouldBlock) — a partial write — the remaining
 // bytes are not lost and are delivered on the next WriteTo call.
+// It also asserts the actual byte content to detect duplication or corruption.
 func TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume(t *testing.T) {
 	payload := []byte("ABCDEFGHIJ") // 10-byte payload
 	wire := append([]byte{byte(len(payload))}, payload...)
@@ -1157,7 +1182,7 @@ func TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume(t *testing.T) {
 	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
 
 	// dst accepts only 4 bytes before returning ErrWouldBlock with partial progress.
-	dst := &fwWouldBlockWriter{limit: 4}
+	dst := &capWouldBlockWriter{limit: 4}
 	n1, err1 := r.WriteTo(dst)
 	if !errors.Is(err1, iox.ErrWouldBlock) {
 		t.Fatalf("first WriteTo: want ErrWouldBlock, got (%d, %v)", n1, err1)
@@ -1169,7 +1194,6 @@ func TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume(t *testing.T) {
 	// Raise the limit so the remaining 6 bytes can be written.
 	dst.limit = 10
 	n2, err2 := r.WriteTo(dst)
-	// The remaining 6 bytes should be written; then the reader hits EOF → nil.
 	if err2 != nil {
 		t.Fatalf("second WriteTo: unexpected error: %v", err2)
 	}
@@ -1178,6 +1202,111 @@ func TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume(t *testing.T) {
 	}
 	if n1+n2 != int64(len(payload)) {
 		t.Fatalf("total bytes: want %d, got %d", len(payload), n1+n2)
+	}
+	if got := dst.buf.Bytes(); !bytes.Equal(got, payload) {
+		t.Fatalf("content mismatch: got %q, want %q", got, payload)
+	}
+}
+
+// resumeErrWriter first accepts partial bytes with ErrWouldBlock, then on the
+// resume call returns a hard error after zero bytes.
+type resumeErrWriter struct {
+	buf     bytes.Buffer
+	limit   int
+	hardErr error
+	failed  bool
+}
+
+func (w *resumeErrWriter) Write(p []byte) (int, error) {
+	rem := w.limit - w.buf.Len()
+	if rem <= 0 {
+		if !w.failed {
+			w.failed = true
+			return 0, w.hardErr
+		}
+		return 0, w.hardErr
+	}
+	use := len(p)
+	if use > rem {
+		use = rem
+	}
+	n, _ := w.buf.Write(p[:use])
+	if use < len(p) {
+		return n, iox.ErrWouldBlock
+	}
+	return n, nil
+}
+
+// TestReader_WriteTo_Stream_PartialDstWrite_Resume_HardError verifies that a
+// non-semantic error during the resume write loop clears the resume state and
+// propagates the error.
+func TestReader_WriteTo_Stream_PartialDstWrite_Resume_HardError(t *testing.T) {
+	payload := []byte("ABCDEFGHIJ")
+	wire := append([]byte{byte(len(payload))}, payload...)
+
+	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+
+	// Accept 4 bytes, then ErrWouldBlock on the 5th.
+	boom := errors.New("disk full")
+	dst := &resumeErrWriter{limit: 4, hardErr: boom}
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first WriteTo: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+
+	// Resume: dst now returns hard error immediately.
+	n2, err2 := r.WriteTo(dst)
+	if !errors.Is(err2, boom) {
+		t.Fatalf("second WriteTo: want %v, got (%d, %v)", boom, n2, err2)
+	}
+}
+
+// zeroWriteWriter first accepts partial bytes with ErrWouldBlock, then on the
+// resume call returns (0, nil) — a zero-length write without error.
+type zeroWriteWriter struct {
+	buf       bytes.Buffer
+	limit     int
+	zeroAfter bool
+}
+
+func (w *zeroWriteWriter) Write(p []byte) (int, error) {
+	if w.zeroAfter {
+		return 0, nil
+	}
+	rem := w.limit - w.buf.Len()
+	if rem <= 0 {
+		return 0, iox.ErrWouldBlock
+	}
+	use := len(p)
+	if use > rem {
+		use = rem
+	}
+	n, _ := w.buf.Write(p[:use])
+	if use < len(p) {
+		return n, iox.ErrWouldBlock
+	}
+	return n, nil
+}
+
+// TestReader_WriteTo_Stream_PartialDstWrite_Resume_ZeroWrite verifies that a
+// zero-length write (0, nil) during the resume loop returns io.ErrShortWrite.
+func TestReader_WriteTo_Stream_PartialDstWrite_Resume_ZeroWrite(t *testing.T) {
+	payload := []byte("ABCDEFGHIJ")
+	wire := append([]byte{byte(len(payload))}, payload...)
+
+	r := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+
+	dst := &zeroWriteWriter{limit: 4}
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) {
+		t.Fatalf("first WriteTo: want ErrWouldBlock, got (%d, %v)", n1, err1)
+	}
+
+	// Resume: dst now returns (0, nil) on every write.
+	dst.zeroAfter = true
+	n2, err2 := r.WriteTo(dst)
+	if !errors.Is(err2, io.ErrShortWrite) {
+		t.Fatalf("second WriteTo: want ErrShortWrite, got (%d, %v)", n2, err2)
 	}
 }
 
