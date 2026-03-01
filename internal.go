@@ -122,6 +122,9 @@ func (fr *framer) readOnce(p []byte) (n int, err error) {
 		if len(p) != 0 && n == 0 && err == nil {
 			return 0, io.ErrNoProgress
 		}
+		if n > 0 {
+			return n, err
+		}
 		if err != ErrWouldBlock {
 			return n, err
 		}
@@ -139,6 +142,9 @@ func (fr *framer) writeOnce(p []byte) (n int, err error) {
 		// writer can spin indefinitely.
 		if len(p) != 0 && n == 0 && err == nil {
 			return 0, io.ErrShortWrite
+		}
+		if n > 0 {
+			return n, err
 		}
 		if err != ErrWouldBlock {
 			return n, err
