@@ -767,3 +767,91 @@ func TestReadStream_NonEOFErrorDuringExtendedHeader(t *testing.T) {
 		t.Fatalf("err=%v want %v", err, customErr)
 	}
 }
+
+// partialWouldBlockReader returns (n>0, ErrWouldBlock) on the first call,
+// then delivers the remaining data normally.
+type partialWouldBlockReader struct {
+	data    []byte
+	off     int
+	partial int // bytes to return with ErrWouldBlock on first call
+	called  int
+}
+
+func (r *partialWouldBlockReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	r.called++
+	if r.called == 1 && r.partial > 0 {
+		n := copy(p, r.data[r.off:r.off+r.partial])
+		r.off += n
+		return n, iox.ErrWouldBlock
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+// TestReadOnce_ProgressFirst_NoOverwrite verifies that readOnce returns
+// immediately when the underlying reader returns (n>0, ErrWouldBlock),
+// preventing data corruption from retrying with the same buffer slice.
+func TestReadOnce_ProgressFirst_NoOverwrite(t *testing.T) {
+	payload := []byte("ABCDEFGHIJ")
+	rd := &partialWouldBlockReader{data: payload, partial: 4}
+	fr := newFramer(rd, nil)
+	fr.retryDelay = 0 // blocking mode
+
+	buf := make([]byte, 10)
+	n, err := fr.readOnce(buf)
+	if n != 4 {
+		t.Fatalf("readOnce: want n=4, got n=%d", n)
+	}
+	if err != iox.ErrWouldBlock {
+		t.Fatalf("readOnce: want ErrWouldBlock, got %v", err)
+	}
+	if string(buf[:n]) != "ABCD" {
+		t.Fatalf("readOnce: got %q, want %q", string(buf[:n]), "ABCD")
+	}
+}
+
+// partialWouldBlockWriter returns (n>0, ErrWouldBlock) on the first call,
+// then accepts all remaining data normally.
+type partialWouldBlockWriter struct {
+	buf     bytes.Buffer
+	partial int
+	called  int
+}
+
+func (w *partialWouldBlockWriter) Write(p []byte) (int, error) {
+	w.called++
+	if w.called == 1 && w.partial > 0 {
+		use := w.partial
+		if use > len(p) {
+			use = len(p)
+		}
+		n, _ := w.buf.Write(p[:use])
+		return n, iox.ErrWouldBlock
+	}
+	return w.buf.Write(p)
+}
+
+// TestWriteOnce_ProgressFirst_NoDuplication verifies that writeOnce returns
+// immediately when the underlying writer returns (n>0, ErrWouldBlock),
+// preventing data duplication from retrying with the same buffer slice.
+func TestWriteOnce_ProgressFirst_NoDuplication(t *testing.T) {
+	dst := &partialWouldBlockWriter{partial: 4}
+	fr := newFramer(nil, dst)
+	fr.retryDelay = 0 // blocking mode
+
+	payload := []byte("ABCDEFGHIJ")
+	n, err := fr.writeOnce(payload)
+	if n != 4 {
+		t.Fatalf("writeOnce: want n=4, got n=%d", n)
+	}
+	if err != iox.ErrWouldBlock {
+		t.Fatalf("writeOnce: want ErrWouldBlock, got %v", err)
+	}
+	if got := dst.buf.String(); got != "ABCD" {
+		t.Fatalf("writeOnce: got %q, want %q", got, "ABCD")
+	}
+}
