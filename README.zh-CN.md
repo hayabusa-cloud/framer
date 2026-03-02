@@ -24,6 +24,7 @@
 - `BinaryStream`（流式传输：TCP、TLS-over-TCP、Unix stream、pipe）：添加长度前缀；读/写整条消息。
 - `SeqPacket`（例如 SCTP、WebSocket）：透传；底层已保留边界。
 - `Datagram`（例如 UDP、Unix datagram）：透传；底层已保留边界。
+- 分组模式按设计透传：`WithReadLimit` 在一次接收后检查，超大分组可能返回 `n > limit` 与 `ErrTooLong`；`n` 表示本次已消费字节数。
 
 可在构造时通过 `WithProtocol(...)` 选择（读/写方向也有独立选项），或使用传输助手（见 Options）。
 
@@ -97,7 +98,7 @@ for {
 
 - `WithProtocol(proto Protocol)` — 选择 `BinaryStream`、`SeqPacket` 或 `Datagram`（读/写方向也有独立选项）。
 - 字节序：`WithByteOrder`，或 `WithReadByteOrder` / `WithWriteByteOrder`。
-- `WithReadLimit(n int)` — 限制读取时允许的最大消息 payload。
+- `WithReadLimit(n int)` — 限制读取时允许的最大消息 payload；在分组模式中为读后检查，可能返回 `n > limit` 与 `ErrTooLong`。
 - `WithRetryDelay(d time.Duration)` — 配置 would-block 策略；快捷：`WithNonblock()` / `WithBlock()`。
 
 传输助手（便捷预设）：
@@ -112,6 +113,17 @@ for {
 更多内容：GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 
 ## 语义契约（Semantics Contract）
+
+### 分组模式说明（`SeqPacket` / `Datagram`）
+
+- 分组模式保留底层边界，不做分片。
+- `WithReadLimit` 在单次收包后执行，超限分组可能返回 `(n > limit, ErrTooLong)`。
+- `n` 是调用方应计入的已消费字节数。
+
+### 性能约定
+
+- 热路径为了稳态吞吐保持最少运行时检查。
+- 调用方负责保证选项/缓冲参数有效，并在 `ErrWouldBlock` / `ErrMore` 后使用同一实例重试。
 
 ### 错误分类
 
@@ -181,7 +193,7 @@ for {
 | 读阶段 would-block | 本次读到的字节数 | `ErrWouldBlock` |
 | 写阶段 would-block | 本次写出的字节数 | `ErrWouldBlock` |
 | 消息超过内部缓冲 | 0 | `io.ErrShortBuffer` |
-| 消息超过 ReadLimit | 0 | `ErrTooLong` |
+| 消息超过 ReadLimit | 本次读取字节数（可能超过限制） | `ErrTooLong` |
 | 流在消息中途结束 | 当前累计字节数 | `io.ErrUnexpectedEOF` |
 
 ### 操作分类
@@ -212,7 +224,7 @@ for {
 
 - `(*Reader).WriteTo(io.Writer)` — 高效地将分帧消息的 payload 传到 `dst`。
   - Stream（`BinaryStream`）：逐条消息处理，只把 payload 字节写到 `dst`。若 `ReadLimit == 0`，会使用保守的默认上限（64KiB）；超过该上限的消息返回 `framer.ErrTooLong`。
-  - Packet（`SeqPacket`/`Datagram`）：透传（读字节、写字节）。
+  - Packet（`SeqPacket`/`Datagram`）：透传（读字节、写字节）；限制在读后检查，`n` 仍表示已消费字节数。
   - 语义错误 `framer.ErrWouldBlock` / `framer.ErrMore` 会原样传播，并且进度计数反映已写入的字节数。
 
 - `(*Writer).ReadFrom(io.Reader)` — chunk-to-message：src 每次成功 `Read` 的 chunk 会被编码为一条消息并通过 `w.Write` 写出。

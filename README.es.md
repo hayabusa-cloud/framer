@@ -24,6 +24,7 @@ Muchos transportes son flujos de bytes (TCP, Unix stream, pipes). Un solo `Read`
 - `BinaryStream` (transportes stream: TCP, TLS-over-TCP, Unix stream, pipes): agrega un prefijo de longitud; lee/escribe mensajes completos.
 - `SeqPacket` (p. ej., SCTP, WebSocket): pass-through; el transporte ya preserva límites.
 - `Datagram` (p. ej., UDP, Unix datagram): pass-through; el transporte ya preserva límites.
+- En modos packet, el diseño es pass-through: `WithReadLimit` se verifica después de una recepción, por lo que un paquete sobredimensionado puede devolver `n > limit` con `ErrTooLong`; `n` es el conteo de bytes consumidos.
 
 Selecciona al construir vía `WithProtocol(...)` (hay variantes de lectura/escritura) o usa los helpers de transporte (ver Options).
 
@@ -97,7 +98,7 @@ for {
 
 - `WithProtocol(proto Protocol)` — elige `BinaryStream`, `SeqPacket` o `Datagram` (hay variantes de lectura/escritura).
 - Orden de bytes: `WithByteOrder`, o `WithReadByteOrder` / `WithWriteByteOrder`.
-- `WithReadLimit(n int)` — limita el tamaño máximo del payload al leer.
+- `WithReadLimit(n int)` — limita el tamaño máximo del payload al leer; en modos packet se aplica post-lectura y puede devolver `n > limit` con `ErrTooLong`.
 - `WithRetryDelay(d time.Duration)` — política de would-block; helpers: `WithNonblock()` / `WithBlock()`.
 
 Helpers de transporte (presets):
@@ -112,6 +113,17 @@ Helpers de transporte (presets):
 Más: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 
 ## Contrato de semántica (Semantics Contract)
+
+### Nota de modo packet (`SeqPacket` / `Datagram`)
+
+- El modo packet preserva límites del transporte y no divide paquetes.
+- `WithReadLimit` se aplica después de una lectura de paquete; un paquete sobredimensionado puede devolver `(n > limit, ErrTooLong)`.
+- `n` es el conteo de bytes consumidos que debe contabilizar el llamador.
+
+### Contrato de rendimiento
+
+- Las rutas calientes minimizan verificaciones en runtime para mantener throughput estable.
+- El llamador es responsable de opciones/buffers válidos y de reintentar con la misma instancia tras `ErrWouldBlock` o `ErrMore`.
 
 ### Taxonomía de errores
 
@@ -181,7 +193,7 @@ Más: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 | Would-block en fase de lectura | bytes leídos en esta llamada | `ErrWouldBlock` |
 | Would-block en fase de escritura | bytes escritos en esta llamada | `ErrWouldBlock` |
 | Mensaje excede el buffer interno | 0 | `io.ErrShortBuffer` |
-| Mensaje excede ReadLimit | 0 | `ErrTooLong` |
+| Mensaje excede ReadLimit | bytes leídos en esta llamada (pueden exceder el límite) | `ErrTooLong` |
 | Stream terminó a mitad de mensaje | bytes hasta ahora | `io.ErrUnexpectedEOF` |
 
 ### Clasificación de operaciones
@@ -212,7 +224,7 @@ Ningún método oculta bloqueo a menos que se configure explícitamente.
 
 - `(*Reader).WriteTo(io.Writer)` — transfiere eficientemente payloads a `dst`.
   - Stream (`BinaryStream`): procesa un mensaje por vez y escribe solo bytes de payload. Si `ReadLimit == 0`, usa un tope conservador (64KiB); mensajes más grandes devuelven `framer.ErrTooLong`.
-  - Packet (`SeqPacket`/`Datagram`): pass-through.
+  - Packet (`SeqPacket`/`Datagram`): pass-through; las validaciones de límite son post-lectura y `n` sigue siendo el conteo de bytes consumidos.
   - `framer.ErrWouldBlock` y `framer.ErrMore` se propagan sin cambios, con el conteo reflejando bytes escritos.
 
 - `(*Writer).ReadFrom(io.Reader)` — chunk-to-message: cada chunk leído de `src` se codifica como un mensaje y se escribe vía `w.Write`.

@@ -24,6 +24,7 @@ Many transports are byte streams (TCP, Unix stream, pipes). A single `Read` may 
 - `BinaryStream` (stream transports: TCP, TLS-over-TCP, Unix stream, pipes): adds a length prefix; reads/writes whole messages.
 - `SeqPacket` (e.g., SCTP, WebSocket): pass-through; the transport already preserves boundaries.
 - `Datagram` (e.g., UDP, Unix datagram): pass-through; boundary already preserved.
+- Packet modes are pass-through by design: `WithReadLimit` is checked after one receive, so an oversized packet may return `n > limit` with `ErrTooLong`; `n` is the consumed-byte count.
 
 Select at construction time via `WithProtocol(...)` (read/write variants exist) or via transport helpers (see Options).
 
@@ -99,7 +100,7 @@ for {
 
 - `WithProtocol(proto Protocol)` — choose `BinaryStream`, `SeqPacket`, or `Datagram` (read/write variants available).
 - Byte order: `WithByteOrder`, or `WithReadByteOrder` / `WithWriteByteOrder`.
-- `WithReadLimit(n int)` — cap maximum message payload size when reading.
+- `WithReadLimit(n int)` — cap maximum message payload size when reading; in packet modes this is enforced post-read and may return `n > limit` with `ErrTooLong`.
 - `WithRetryDelay(d time.Duration)` — configure would-block policy; helpers: `WithNonblock()` / `WithBlock()`.
 
 Transport helpers (presets):
@@ -114,6 +115,17 @@ Transport helpers (presets):
 Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 
 ## Semantics Contract
+
+### Packet mode note (`SeqPacket` / `Datagram`)
+
+- Packet mode preserves transport boundaries and does not split packets.
+- `WithReadLimit` is enforced after one packet read; an oversized packet may return `(n > limit, ErrTooLong)`.
+- `n` is the consumed-byte count the caller should account for on that call.
+
+### Performance contract
+
+- Hot paths keep runtime checks minimal for steady-state throughput.
+- Callers are responsible for valid option/buffer usage and same-instance retry after `ErrWouldBlock` or `ErrMore`.
 
 ### Error taxonomy
 
@@ -183,7 +195,7 @@ Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 | Read phase would-block | bytes read this call | `ErrWouldBlock` |
 | Write phase would-block | bytes written this call | `ErrWouldBlock` |
 | Message exceeds internal buffer | 0 | `io.ErrShortBuffer` |
-| Message exceeds ReadLimit | 0 | `ErrTooLong` |
+| Message exceeds ReadLimit | bytes read this call (may exceed limit) | `ErrTooLong` |
 | Stream ended mid-message | bytes so far | `io.ErrUnexpectedEOF` |
 
 ### Operation classification
@@ -214,7 +226,7 @@ No method hides blocking unless explicitly configured.
 
 - `(*Reader).WriteTo(io.Writer)` — efficiently transfers framed message payloads to `dst`.
   - Stream (`BinaryStream`): processes one framed message at a time and writes only the payload bytes to `dst`. If `ReadLimit == 0`, an internal default cap (64KiB) is used; messages larger than this cap return `framer.ErrTooLong`.
-  - Packet (`SeqPacket`/`Datagram`): pass-through (reads bytes, writes bytes).
+  - Packet (`SeqPacket`/`Datagram`): pass-through (reads bytes, writes bytes); limit checks are post-read and `n` remains the consumed-byte count.
   - Semantic errors `framer.ErrWouldBlock` and `framer.ErrMore` are propagated unchanged with the progress count reflecting bytes written.
 
 - `(*Writer).ReadFrom(io.Reader)` — chunk-to-message: each successful `Read` chunk from `src` is encoded as a single framed message.
