@@ -155,6 +155,9 @@ func (fr *framer) writeOnce(p []byte) (n int, err error) {
 	}
 }
 
+// readPacket is pass-through for boundary-preserving transports.
+// ReadLimit is checked after each transport read, so ErrTooLong can be returned
+// with n > limit; n is still the consumed-byte count for this call.
 func (fr *framer) readPacket(p []byte) (n int, err error) {
 	n, err = fr.readOnce(p)
 	if fr.readLimit > 0 && int64(n) > fr.readLimit {
@@ -198,6 +201,9 @@ func (fr *framer) readStream(p []byte) (n int, err error) {
 				}
 				break
 			}
+			if re == ErrMore && rn > 0 {
+				continue
+			}
 			return 0, re
 		}
 	}
@@ -223,6 +229,9 @@ func (fr *framer) readStream(p []byte) (n int, err error) {
 					return 0, io.ErrUnexpectedEOF
 				}
 				break
+			}
+			if re == ErrMore && rn > 0 {
+				continue
 			}
 			return 0, re
 		}
@@ -268,7 +277,11 @@ func (fr *framer) readStream(p []byte) (n int, err error) {
 				}
 				break
 			}
-			// Preserve semantic control-flow errors.
+			// Absorb ErrMore during aggregation: more data is available
+			// right now, so keep reading toward the message boundary.
+			if re == ErrMore && rn > 0 {
+				continue
+			}
 			return n, re
 		}
 	}
@@ -322,6 +335,9 @@ func (fr *framer) writeStream(p []byte) (n int, err error) {
 		wn, we := fr.writeOnce(fr.header[fr.offset:hdrSize])
 		fr.offset += int64(wn)
 		if we != nil {
+			if we == ErrMore && wn > 0 {
+				continue
+			}
 			return 0, we
 		}
 	}
@@ -332,6 +348,9 @@ func (fr *framer) writeStream(p []byte) (n int, err error) {
 		fr.offset += int64(wn)
 		n += wn
 		if we != nil {
+			if we == ErrMore && wn > 0 {
+				continue
+			}
 			return n, we
 		}
 	}

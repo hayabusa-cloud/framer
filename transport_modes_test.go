@@ -714,7 +714,7 @@ func (w *wouldBlockWriter2) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func TestStreamRead_PropagatesErrMore(t *testing.T) {
+func TestStreamRead_AbsorbsErrMore(t *testing.T) {
 	msg := []byte("multi-shot")
 	var raw bytes.Buffer
 	w := fr.NewWriter(&raw, fr.WithProtocol(fr.BinaryStream))
@@ -728,23 +728,15 @@ func TestStreamRead_PropagatesErrMore(t *testing.T) {
 	r := fr.NewReader(mr, fr.WithProtocol(fr.BinaryStream))
 
 	buf := make([]byte, len(msg))
-	n1, err := r.Read(buf)
-	if !errors.Is(err, iox.ErrMore) {
-		t.Fatalf("first read: err=%v want=%v", err, iox.ErrMore)
-	}
-	if n1 <= 0 || n1 >= len(msg) {
-		t.Fatalf("first read: n=%d want in (0,%d)", n1, len(msg))
-	}
-
-	n2, err := r.Read(buf)
+	n, err := r.Read(buf)
 	if err != nil {
-		t.Fatalf("second read: %v", err)
+		t.Fatalf("read: err=%v want=nil", err)
 	}
-	if n1+n2 != len(msg) {
-		t.Fatalf("total read: %d want=%d", n1+n2, len(msg))
+	if n != len(msg) {
+		t.Fatalf("read: n=%d want=%d", n, len(msg))
 	}
-	if !bytes.Equal(buf, msg) {
-		t.Fatalf("payload mismatch")
+	if !bytes.Equal(buf[:n], msg) {
+		t.Fatalf("payload mismatch: got %q want %q", buf[:n], msg)
 	}
 }
 

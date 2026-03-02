@@ -89,6 +89,10 @@ func WithWriteProtocol(proto Protocol) Option {
 	return func(o *Options) { o.WriteProto = proto }
 }
 
+// WithReadLimit sets the maximum accepted payload size on the read side.
+//
+// In SeqPacket/Datagram mode, the limit is checked after a packet read, so an
+// oversized packet may return (n > limit, ErrTooLong).
 func WithReadLimit(limit int) Option {
 	return func(o *Options) { o.ReadLimit = limit }
 }
