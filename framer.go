@@ -9,9 +9,14 @@
 //   - Protocol adaptation: on stream transports (e.g., TCP), framer adds a compact
 //     length prefix and preserves one-message-per-Read/Write. On boundary-preserving
 //     transports (SeqPacket/Datagram: e.g., SCTP, UDP, WebSocket), framer is pass-through.
+//   - Packet-mode limit semantics: in SeqPacket/Datagram mode, WithReadLimit is checked
+//     after one transport read; oversized packets may return (n > limit, ErrTooLong), and
+//     n remains the consumed-byte count for caller-side accounting.
 //   - Non-blocking first: iox.ErrWouldBlock and iox.ErrMore are surfaced as control-flow
 //     signals (and re-exposed as framer.ErrWouldBlock / framer.ErrMore). Hot paths avoid
 //     allocations and return promptly.
+//   - Performance contract: hot paths keep runtime validation minimal; callers are
+//     responsible for valid option/buffer usage and same-instance retry discipline.
 //   - io compatibility: Reader, Writer, and ReadWriter implement standard io interfaces
 //     and honor io.Writer short-write contracts and io.Reader buffer semantics.
 //
@@ -58,6 +63,12 @@ func NewPipe(opts ...Option) (reader io.Reader, writer io.Writer) {
 // Reader reads framed messages.
 type Reader struct{ fr *framer }
 
+// Read returns one message payload in stream mode and pass-through bytes in
+// packet-preserving modes.
+//
+// In SeqPacket/Datagram mode, WithReadLimit is enforced after one transport
+// read, so an oversized packet may return (n > limit, ErrTooLong); n still
+// reports consumed bytes for caller-side accounting.
 func (r *Reader) Read(p []byte) (int, error) { return r.fr.read(p) }
 
 // WriteTo implements io.WriterTo.
@@ -70,6 +81,7 @@ func (r *Reader) Read(p []byte) (int, error) { return r.fr.read(p) }
 //     the Reader's ReadLimit; when ReadLimit is zero, a conservative default cap is used
 //     (64KiB) and messages exceeding this cap result in ErrTooLong.
 //   - Packet (SeqPacket/Datagram): pass-through, reads bytes and writes them to dst.
+//     ReadLimit is checked post-read, so ErrTooLong may be returned with n > limit.
 //
 // Non-blocking semantics: if the underlying reader or writer returns iox.ErrWouldBlock
 // or iox.ErrMore, WriteTo returns immediately with the progress count (bytes written) and

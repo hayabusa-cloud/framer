@@ -9,23 +9,22 @@
 
 用于 Go 的可移植消息分帧库。在流式传输上实现“一次 `Read` / `Write` 对应一条消息”。
 
-范围：`framer` 解决流式传输中的消息边界问题。
+范围：流式传输的消息边界保持。
 
-## 一览
-
-- 解决字节流（TCP、Unix stream、pipe）的消息边界问题。
-- 对天然保留边界的传输（UDP、Unix datagram、WebSocket、SCTP）做透传。
-- 可移植线格式；可配置字节序。
-
-## 为什么
+## 概述
 
 许多传输是字节流（TCP、Unix stream、pipe）。一次 `Read` 可能只返回应用消息的一部分，也可能把多个消息拼在一起返回。`framer` 恢复消息边界：在 stream 模式下，一次 `Read` 只返回一条消息的 payload；一次 `Write` 只发送一条（带长度前缀的）消息。
+
+- 字节流（TCP、Unix stream、pipe）的消息边界保持。
+- 对天然保留边界的传输（UDP、Unix datagram、WebSocket、SCTP）做透传。
+- 可移植线格式；可配置字节序。
 
 ## 协议适配
 
 - `BinaryStream`（流式传输：TCP、TLS-over-TCP、Unix stream、pipe）：添加长度前缀；读/写整条消息。
 - `SeqPacket`（例如 SCTP、WebSocket）：透传；底层已保留边界。
 - `Datagram`（例如 UDP、Unix datagram）：透传；底层已保留边界。
+- 分组模式按设计透传：`WithReadLimit` 在一次接收后检查，超大分组可能返回 `n > limit` 与 `ErrTooLong`；`n` 表示本次已消费字节数。
 
 可在构造时通过 `WithProtocol(...)` 选择（读/写方向也有独立选项），或使用传输助手（见 Options）。
 
@@ -49,7 +48,7 @@
 - 最大支持的 payload 长度为 `2^56-1`；更大的值返回 `framer.ErrTooLong`。
 - 配置读侧限制（`WithReadLimit`）时，超过该限制的长度返回 `framer.ErrTooLong`。
 
-## 快速开始
+## 安装
 
 使用 `go get` 安装：
 ```shell
@@ -74,11 +73,32 @@ if err != nil {
 fmt.Printf("got: %q\n", buf[:n])
 ```
 
-## Options
+## 非阻塞用法
+
+`framer` 默认为非阻塞模式。在事件驱动循环中：
+
+```go
+for {
+    n, err := r.Read(buf)
+    if n > 0 {
+        process(buf[:n])
+    }
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            // 当前无数据；等待可读（epoll、io_uring 等）
+            continue
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
 
 - `WithProtocol(proto Protocol)` — 选择 `BinaryStream`、`SeqPacket` 或 `Datagram`（读/写方向也有独立选项）。
 - 字节序：`WithByteOrder`，或 `WithReadByteOrder` / `WithWriteByteOrder`。
-- `WithReadLimit(n int)` — 限制读取时允许的最大消息 payload。
+- `WithReadLimit(n int)` — 限制读取时允许的最大消息 payload；在分组模式中为读后检查，可能返回 `n > limit` 与 `ErrTooLong`。
 - `WithRetryDelay(d time.Duration)` — 配置 would-block 策略；快捷：`WithNonblock()` / `WithBlock()`。
 
 传输助手（便捷预设）：
@@ -93,6 +113,17 @@ fmt.Printf("got: %q\n", buf[:n])
 更多内容：GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 
 ## 语义契约（Semantics Contract）
+
+### 分组模式说明（`SeqPacket` / `Datagram`）
+
+- 分组模式保留底层边界，不做分片。
+- `WithReadLimit` 在单次收包后执行，超限分组可能返回 `(n > limit, ErrTooLong)`。
+- `n` 是调用方应计入的已消费字节数。
+
+### 性能约定
+
+- 热路径为了稳态吞吐保持最少运行时检查。
+- 调用方负责保证选项/缓冲参数有效，并在 `ErrWouldBlock` / `ErrMore` 后使用同一实例重试。
 
 ### 错误分类
 
@@ -162,7 +193,7 @@ fmt.Printf("got: %q\n", buf[:n])
 | 读阶段 would-block | 本次读到的字节数 | `ErrWouldBlock` |
 | 写阶段 would-block | 本次写出的字节数 | `ErrWouldBlock` |
 | 消息超过内部缓冲 | 0 | `io.ErrShortBuffer` |
-| 消息超过 ReadLimit | 0 | `ErrTooLong` |
+| 消息超过 ReadLimit | 本次读取字节数（可能超过限制） | `ErrTooLong` |
 | 流在消息中途结束 | 当前累计字节数 | `io.ErrUnexpectedEOF` |
 
 ### 操作分类
@@ -185,13 +216,15 @@ fmt.Printf("got: %q\n", buf[:n])
 
 除非显式配置，否则任何方法都不会隐藏阻塞。
 
+`framer` 使用 `code.hybscloud.com/iox` 的控制流信号。`ErrWouldBlock` 和 `ErrMore` 是 `iox` 的别名，可与其他 `iox` 感知组件（`iofd`、`takt`）直接集成。
+
 ## 快路径（Fast paths）
 
 `framer` 实现了标准库的复制快路径，以便与 `io.Copy` 风格的引擎以及 `iox.CopyPolicy` 互操作：
 
 - `(*Reader).WriteTo(io.Writer)` — 高效地将分帧消息的 payload 传到 `dst`。
   - Stream（`BinaryStream`）：逐条消息处理，只把 payload 字节写到 `dst`。若 `ReadLimit == 0`，会使用保守的默认上限（64KiB）；超过该上限的消息返回 `framer.ErrTooLong`。
-  - Packet（`SeqPacket`/`Datagram`）：透传（读字节、写字节）。
+  - Packet（`SeqPacket`/`Datagram`）：透传（读字节、写字节）；限制在读后检查，`n` 仍表示已消费字节数。
   - 语义错误 `framer.ErrWouldBlock` / `framer.ErrMore` 会原样传播，并且进度计数反映已写入的字节数。
 
 - `(*Writer).ReadFrom(io.Reader)` — chunk-to-message：src 每次成功 `Read` 的 chunk 会被编码为一条消息并通过 `w.Write` 写出。
@@ -200,6 +233,8 @@ fmt.Printf("got: %q\n", buf[:n])
   - 语义错误 `framer.ErrWouldBlock` / `framer.ErrMore` 会原样传播，并且进度计数反映 payload 进度。
 
 建议：在非阻塞循环中，优先使用带重试策略的 `iox.CopyPolicy`（例如 `PolicyRetry`），以显式处理 `ErrWouldBlock` / `ErrMore`。
+
+**稳态零分配**：在初始缓冲区分配之后，`Forwarder` 和 `WriteTo` 路径复用内部缓冲区。稳态下每条消息不产生堆分配。
 
 **关于部分写入恢复的说明：** 当使用 `iox.Copy` 向非阻塞目标复制时，可能会发生部分写入。如果源不实现 `io.Seeker`，`iox.Copy` 会返回 `iox.ErrNoSeeker` 以防止静默数据丢失。对于不可寻址的源（如网络套接字），请使用 `iox.CopyPolicy` 并为写入端语义错误配置 `PolicyRetry`，以确保所有已读字节在返回前被写入。
 
@@ -211,6 +246,27 @@ fmt.Printf("got: %q\n", buf[:n])
   - 限制：当内部缓冲不足时返回 `io.ErrShortBuffer`；当消息超过 `WithReadLimit` 配置的限制时返回 `framer.ErrTooLong`。
   - 构造后稳态零分配；内部 scratch buffer 会被复用。
 
+消息级中继示例：
+
+```go
+fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+
+for {
+    _, err := fwd.ForwardOnce()
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            continue // 等待 src 可读或 dst 可写
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
+
 ## 许可证
 
-MIT — 参见 `LICENSE`。
+MIT — 参见 [LICENSE](LICENSE)。
+
+©2025 [Hayabusa Cloud Co., Ltd.](https://code.hybscloud.com)

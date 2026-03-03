@@ -9,23 +9,22 @@
 
 Framing de mensajes portable para Go. Conserva “un mensaje por `Read`/`Write`” sobre transportes tipo stream.
 
-Alcance: `framer` resuelve la preservación de límites de mensaje en transportes de flujo.
+Alcance: preservación de límites de mensaje en transportes de flujo.
 
-## En resumen
-
-- Resuelve problemas de límites de mensaje en flujos de bytes (TCP, Unix stream, pipes).
-- Pass-through en transportes que ya preservan límites (UDP, Unix datagram, WebSocket, SCTP).
-- Formato wire portable; orden de bytes configurable.
-
-## Por qué
+## Descripción general
 
 Muchos transportes son flujos de bytes (TCP, Unix stream, pipes). Un solo `Read` puede devolver una fracción de un mensaje de aplicación, o varios mensajes concatenados. `framer` restaura los límites: en modo stream, un `Read` devuelve exactamente un payload de mensaje y un `Write` emite exactamente un mensaje enmarcado.
+
+- Preservación de límites de mensaje en flujos de bytes (TCP, Unix stream, pipes).
+- Pass-through en transportes que ya preservan límites (UDP, Unix datagram, WebSocket, SCTP).
+- Formato wire portable; orden de bytes configurable.
 
 ## Adaptación de protocolo
 
 - `BinaryStream` (transportes stream: TCP, TLS-over-TCP, Unix stream, pipes): agrega un prefijo de longitud; lee/escribe mensajes completos.
 - `SeqPacket` (p. ej., SCTP, WebSocket): pass-through; el transporte ya preserva límites.
 - `Datagram` (p. ej., UDP, Unix datagram): pass-through; el transporte ya preserva límites.
+- En modos packet, el diseño es pass-through: `WithReadLimit` se verifica después de una recepción, por lo que un paquete sobredimensionado puede devolver `n > limit` con `ErrTooLong`; `n` es el conteo de bytes consumidos.
 
 Selecciona al construir vía `WithProtocol(...)` (hay variantes de lectura/escritura) o usa los helpers de transporte (ver Options).
 
@@ -49,7 +48,7 @@ Límites y errores:
 - La longitud máxima de payload soportada es `2^56-1`; valores mayores producen `framer.ErrTooLong`.
 - Con un límite de lectura (`WithReadLimit`), longitudes mayores fallan con `framer.ErrTooLong`.
 
-## Inicio rápido
+## Instalación
 
 Instala con `go get`:
 ```shell
@@ -74,11 +73,32 @@ if err != nil {
 fmt.Printf("got: %q\n", buf[:n])
 ```
 
-## Options
+## Uso no bloqueante
+
+`framer` opera en modo no bloqueante por defecto. En un bucle orientado a eventos:
+
+```go
+for {
+    n, err := r.Read(buf)
+    if n > 0 {
+        process(buf[:n])
+    }
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            // Sin datos ahora; esperar disponibilidad de lectura (epoll, io_uring, etc.)
+            continue
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
 
 - `WithProtocol(proto Protocol)` — elige `BinaryStream`, `SeqPacket` o `Datagram` (hay variantes de lectura/escritura).
 - Orden de bytes: `WithByteOrder`, o `WithReadByteOrder` / `WithWriteByteOrder`.
-- `WithReadLimit(n int)` — limita el tamaño máximo del payload al leer.
+- `WithReadLimit(n int)` — limita el tamaño máximo del payload al leer; en modos packet se aplica post-lectura y puede devolver `n > limit` con `ErrTooLong`.
 - `WithRetryDelay(d time.Duration)` — política de would-block; helpers: `WithNonblock()` / `WithBlock()`.
 
 Helpers de transporte (presets):
@@ -93,6 +113,17 @@ Helpers de transporte (presets):
 Más: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 
 ## Contrato de semántica (Semantics Contract)
+
+### Nota de modo packet (`SeqPacket` / `Datagram`)
+
+- El modo packet preserva límites del transporte y no divide paquetes.
+- `WithReadLimit` se aplica después de una lectura de paquete; un paquete sobredimensionado puede devolver `(n > limit, ErrTooLong)`.
+- `n` es el conteo de bytes consumidos que debe contabilizar el llamador.
+
+### Contrato de rendimiento
+
+- Las rutas calientes minimizan verificaciones en runtime para mantener throughput estable.
+- El llamador es responsable de opciones/buffers válidos y de reintentar con la misma instancia tras `ErrWouldBlock` o `ErrMore`.
 
 ### Taxonomía de errores
 
@@ -162,7 +193,7 @@ Más: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 | Would-block en fase de lectura | bytes leídos en esta llamada | `ErrWouldBlock` |
 | Would-block en fase de escritura | bytes escritos en esta llamada | `ErrWouldBlock` |
 | Mensaje excede el buffer interno | 0 | `io.ErrShortBuffer` |
-| Mensaje excede ReadLimit | 0 | `ErrTooLong` |
+| Mensaje excede ReadLimit | bytes leídos en esta llamada (pueden exceder el límite) | `ErrTooLong` |
 | Stream terminó a mitad de mensaje | bytes hasta ahora | `io.ErrUnexpectedEOF` |
 
 ### Clasificación de operaciones
@@ -185,13 +216,15 @@ Por defecto, framer es **no bloqueante** (`WithNonblock()`): devuelve `ErrWouldB
 
 Ningún método oculta bloqueo a menos que se configure explícitamente.
 
+`framer` utiliza las señales de control de flujo de `code.hybscloud.com/iox`. `ErrWouldBlock` y `ErrMore` son alias de `iox`, lo que permite la integración directa con otros componentes compatibles con `iox` (`iofd`, `takt`).
+
 ## Fast paths
 
 `framer` implementa fast paths del stdlib para interoperar con motores tipo `io.Copy` y con `iox.CopyPolicy`:
 
 - `(*Reader).WriteTo(io.Writer)` — transfiere eficientemente payloads a `dst`.
   - Stream (`BinaryStream`): procesa un mensaje por vez y escribe solo bytes de payload. Si `ReadLimit == 0`, usa un tope conservador (64KiB); mensajes más grandes devuelven `framer.ErrTooLong`.
-  - Packet (`SeqPacket`/`Datagram`): pass-through.
+  - Packet (`SeqPacket`/`Datagram`): pass-through; las validaciones de límite son post-lectura y `n` sigue siendo el conteo de bytes consumidos.
   - `framer.ErrWouldBlock` y `framer.ErrMore` se propagan sin cambios, con el conteo reflejando bytes escritos.
 
 - `(*Writer).ReadFrom(io.Reader)` — chunk-to-message: cada chunk leído de `src` se codifica como un mensaje y se escribe vía `w.Write`.
@@ -200,6 +233,8 @@ Ningún método oculta bloqueo a menos que se configure explícitamente.
   - `framer.ErrWouldBlock` y `framer.ErrMore` se propagan sin cambios.
 
 Recomendación: en bucles no bloqueantes, prefiere `iox.CopyPolicy` con política de reintentos (p. ej., `PolicyRetry`) para manejar explícitamente `ErrWouldBlock` / `ErrMore`.
+
+**Cero asignaciones en steady-state**: Tras la asignación inicial del buffer, los paths de `Forwarder` y `WriteTo` reutilizan los buffers internos. No se producen asignaciones en el heap por mensaje en steady-state.
 
 **Nota sobre recuperación de escrituras parciales:** Al usar `iox.Copy` con destinos no bloqueantes, pueden ocurrir escrituras parciales. Si la fuente no implementa `io.Seeker`, `iox.Copy` devuelve `iox.ErrNoSeeker` para evitar pérdida silenciosa de datos. Para fuentes no buscables (p. ej., sockets de red), usa `iox.CopyPolicy` con `PolicyRetry` para errores semánticos del lado de escritura, asegurando que todos los bytes leídos se escriban antes de retornar.
 
@@ -211,6 +246,27 @@ Recomendación: en bucles no bloqueantes, prefiere `iox.CopyPolicy` con polític
   - Límites: `io.ErrShortBuffer` si el buffer interno es insuficiente; `framer.ErrTooLong` si excede `WithReadLimit`.
   - Cero asignaciones en steady-state tras la construcción; el buffer interno se reutiliza.
 
+Ejemplo de relay por mensaje:
+
+```go
+fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+
+for {
+    _, err := fwd.ForwardOnce()
+    if err != nil {
+        if err == framer.ErrWouldBlock {
+            continue // esperar src legible o dst escribible
+        }
+        if err == io.EOF {
+            break
+        }
+        log.Fatal(err)
+    }
+}
+```
+
 ## Licencia
 
-MIT — ver `LICENSE`.
+MIT — ver [LICENSE](LICENSE).
+
+©2025 [Hayabusa Cloud Co., Ltd.](https://code.hybscloud.com)

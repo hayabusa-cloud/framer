@@ -714,7 +714,7 @@ func (w *wouldBlockWriter2) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func TestStreamRead_PropagatesErrMore(t *testing.T) {
+func TestStreamRead_AbsorbsErrMore(t *testing.T) {
 	msg := []byte("multi-shot")
 	var raw bytes.Buffer
 	w := fr.NewWriter(&raw, fr.WithProtocol(fr.BinaryStream))
@@ -728,23 +728,15 @@ func TestStreamRead_PropagatesErrMore(t *testing.T) {
 	r := fr.NewReader(mr, fr.WithProtocol(fr.BinaryStream))
 
 	buf := make([]byte, len(msg))
-	n1, err := r.Read(buf)
-	if !errors.Is(err, iox.ErrMore) {
-		t.Fatalf("first read: err=%v want=%v", err, iox.ErrMore)
-	}
-	if n1 <= 0 || n1 >= len(msg) {
-		t.Fatalf("first read: n=%d want in (0,%d)", n1, len(msg))
-	}
-
-	n2, err := r.Read(buf)
+	n, err := r.Read(buf)
 	if err != nil {
-		t.Fatalf("second read: %v", err)
+		t.Fatalf("read: err=%v want=nil", err)
 	}
-	if n1+n2 != len(msg) {
-		t.Fatalf("total read: %d want=%d", n1+n2, len(msg))
+	if n != len(msg) {
+		t.Fatalf("read: n=%d want=%d", n, len(msg))
 	}
-	if !bytes.Equal(buf, msg) {
-		t.Fatalf("payload mismatch")
+	if !bytes.Equal(buf[:n], msg) {
+		t.Fatalf("payload mismatch: got %q want %q", buf[:n], msg)
 	}
 }
 
@@ -778,5 +770,227 @@ func (r *moreReader2) Read(p []byte) (int, error) {
 		n := copy(p, r.wire[r.off:])
 		r.off += n
 		return n, nil
+	}
+}
+
+type nErrReader2 struct {
+	steps []struct {
+		b   []byte
+		err error
+	}
+	step int
+}
+
+func (r *nErrReader2) Read(p []byte) (int, error) {
+	if r.step >= len(r.steps) {
+		return 0, io.EOF
+	}
+	st := r.steps[r.step]
+	r.step++
+	n := copy(p, st.b)
+	return n, st.err
+}
+
+func TestStreamRead_HeaderErrMoreWithProgress_Absorbs(t *testing.T) {
+	msg := []byte("abc")
+	var raw bytes.Buffer
+	w := fr.NewWriter(&raw, fr.WithProtocol(fr.BinaryStream))
+	if _, err := w.Write(msg); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wire := raw.Bytes()
+
+	under := &nErrReader2{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: wire[:1], err: iox.ErrMore}, // minimal header with progress
+		{b: wire[1:]},
+	}}
+	r := fr.NewReader(under, fr.WithProtocol(fr.BinaryStream))
+
+	buf := make([]byte, len(msg))
+	n, err := r.Read(buf)
+	if err != nil || n != len(msg) || !bytes.Equal(buf[:n], msg) {
+		t.Fatalf("read: got (%d, %v, %q), want (%d, nil, %q)", n, err, buf[:n], len(msg), msg)
+	}
+}
+
+func TestStreamRead_ExtendedHeaderErrMoreWithProgress_Absorbs(t *testing.T) {
+	msg := bytes.Repeat([]byte{'x'}, 300) // requires 16-bit extended length
+	var raw bytes.Buffer
+	w := fr.NewWriter(&raw, fr.WithProtocol(fr.BinaryStream))
+	if _, err := w.Write(msg); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wire := raw.Bytes()
+
+	under := &nErrReader2{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: wire[:1]},
+		{b: wire[1:3], err: iox.ErrMore}, // extended header with progress
+		{b: wire[3:]},
+	}}
+	r := fr.NewReader(under, fr.WithProtocol(fr.BinaryStream))
+
+	buf := make([]byte, len(msg))
+	n, err := r.Read(buf)
+	if err != nil || n != len(msg) || !bytes.Equal(buf[:n], msg) {
+		t.Fatalf("read: got (%d, %v), want (%d, nil)", n, err, len(msg))
+	}
+}
+
+func TestStreamRead_HeaderErrMoreZeroProgress_Propagates(t *testing.T) {
+	under := &scriptedReader2{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{err: iox.ErrMore},
+	}}
+	r := fr.NewReader(under, fr.WithProtocol(fr.BinaryStream))
+
+	buf := make([]byte, 8)
+	n, err := r.Read(buf)
+	if n != 0 || !errors.Is(err, iox.ErrMore) {
+		t.Fatalf("want (0, ErrMore), got (%d, %v)", n, err)
+	}
+}
+
+func TestStreamRead_ExtendedHeaderErrMoreZeroProgress_Propagates(t *testing.T) {
+	under := &scriptedReader2{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: []byte{0xFE}}, // 16-bit length marker
+		{err: iox.ErrMore},
+	}}
+	r := fr.NewReader(under, fr.WithProtocol(fr.BinaryStream))
+
+	buf := make([]byte, 256)
+	n, err := r.Read(buf)
+	if n != 0 || !errors.Is(err, iox.ErrMore) {
+		t.Fatalf("want (0, ErrMore), got (%d, %v)", n, err)
+	}
+}
+
+func TestStreamRead_PayloadErrMoreZeroProgress_Propagates(t *testing.T) {
+	msg := []byte("abc")
+	var raw bytes.Buffer
+	w := fr.NewWriter(&raw, fr.WithProtocol(fr.BinaryStream))
+	if _, err := w.Write(msg); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wire := raw.Bytes()
+
+	under := &scriptedReader2{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: wire[:1]}, // full header
+		{err: iox.ErrMore},
+	}}
+	r := fr.NewReader(under, fr.WithProtocol(fr.BinaryStream))
+
+	buf := make([]byte, len(msg))
+	n, err := r.Read(buf)
+	if n != 0 || !errors.Is(err, iox.ErrMore) {
+		t.Fatalf("want (0, ErrMore), got (%d, %v)", n, err)
+	}
+}
+
+type scriptedErrMoreWriter2 struct {
+	steps []struct {
+		n   int
+		err error
+	}
+	call int
+	buf  bytes.Buffer
+}
+
+func (w *scriptedErrMoreWriter2) Write(p []byte) (int, error) {
+	if w.call < len(w.steps) {
+		st := w.steps[w.call]
+		w.call++
+		n := st.n
+		if n < 0 {
+			n = 0
+		}
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.buf.Write(p[:n])
+		}
+		return n, st.err
+	}
+	w.call++
+	return w.buf.Write(p)
+}
+
+func TestStreamWrite_HeaderErrMoreZeroProgress_Propagates(t *testing.T) {
+	dst := &scriptedErrMoreWriter2{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrMore},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.BinaryStream))
+
+	n, err := w.Write([]byte("hello"))
+	if n != 0 || !errors.Is(err, iox.ErrMore) {
+		t.Fatalf("want (0, ErrMore), got (%d, %v)", n, err)
+	}
+}
+
+func TestStreamWrite_PayloadErrMoreZeroProgress_Propagates(t *testing.T) {
+	dst := &scriptedErrMoreWriter2{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 1, err: nil},         // full 1-byte header
+		{n: 0, err: iox.ErrMore}, // payload phase, zero progress
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.BinaryStream))
+
+	n, err := w.Write([]byte("hello"))
+	if n != 0 || !errors.Is(err, iox.ErrMore) {
+		t.Fatalf("want (0, ErrMore), got (%d, %v)", n, err)
+	}
+}
+
+func TestStreamWrite_AbsorbsErrMoreWithProgressAndResetsState(t *testing.T) {
+	dst := &scriptedErrMoreWriter2{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 1, err: iox.ErrMore}, // header phase
+		{n: 2, err: iox.ErrMore}, // payload phase
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.BinaryStream))
+
+	msg1 := []byte("hello")
+	n, err := w.Write(msg1)
+	if err != nil || n != len(msg1) {
+		t.Fatalf("first write: got (%d, %v), want (%d, nil)", n, err, len(msg1))
+	}
+
+	msg2 := []byte("ok")
+	n, err = w.Write(msg2)
+	if err != nil || n != len(msg2) {
+		t.Fatalf("second write: got (%d, %v), want (%d, nil)", n, err, len(msg2))
+	}
+
+	r := fr.NewReader(bytes.NewReader(dst.buf.Bytes()), fr.WithProtocol(fr.BinaryStream))
+	buf1 := make([]byte, len(msg1))
+	n, err = r.Read(buf1)
+	if err != nil || n != len(msg1) || !bytes.Equal(buf1[:n], msg1) {
+		t.Fatalf("decode msg1: got (%d, %v, %q), want (%d, nil, %q)", n, err, buf1[:n], len(msg1), msg1)
+	}
+	buf2 := make([]byte, len(msg2))
+	n, err = r.Read(buf2)
+	if err != nil || n != len(msg2) || !bytes.Equal(buf2[:n], msg2) {
+		t.Fatalf("decode msg2: got (%d, %v, %q), want (%d, nil, %q)", n, err, buf2[:n], len(msg2), msg2)
 	}
 }
