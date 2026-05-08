@@ -12,10 +12,21 @@ import (
 )
 
 const (
-	frameHeaderLen          = 1
-	framePayloadMaxLen8Bits = 1<<8 - 3
-	framePayloadMaxLen16    = 1<<16 - 1
-	framePayloadMaxLen56    = 1<<56 - 1
+	frameHeaderLen           = 1
+	framePayloadMaxLen8Bits  = 1<<8 - 3
+	framePayloadMaxLen16     = 1<<16 - 1
+	framePayloadMaxLen56     = 1<<56 - 1
+	defaultPacketTransferMax = 64 * 1024
+)
+
+type writeToMode uint8
+
+const (
+	writeToNone writeToMode = iota
+	writeToByte
+	writeToPacket
+	writeToFrame
+	writeToControl
 )
 
 type framer struct {
@@ -38,15 +49,24 @@ type framer struct {
 	// reusable scratch buffer for Reader.WriteTo fast path
 	rbuf []byte
 
-	// WriteTo partial-write resume state: when dst.Write returns a
-	// partial result with ErrWouldBlock/ErrMore, wtOff..wtLen marks
-	// the unwritten region inside rbuf so the next WriteTo call can
-	// finish draining before reading a new message.
-	wtOff int
-	wtLen int
+	// WriteTo pending state. wtMode selects byte suffix, packet-atomic,
+	// stream-frame same-message retry, or deferred source control. Pending
+	// bytes live in rbuf. wtOff is meaningful only for byte mode. wtAfter is
+	// the source signal returned with admitted packet bytes.
+	wtMode  writeToMode
+	wtOff   int
+	wtLen   int
+	wtAfter error
 
 	// reusable scratch buffer for Writer.ReadFrom fast path
 	wbuf []byte
+
+	// ReadFrom pending state. Pending bytes live in wbuf and have already been
+	// counted as bytes read from src. rfAfter stores a source signal returned with
+	// n > 0 and is reported after the pending bytes are emitted. rfLen == 0 with
+	// rfAfter != nil is a control-only pending source signal.
+	rfLen   int
+	rfAfter error
 }
 
 func newFramer(r io.Reader, w io.Writer, opts ...Option) *framer {
@@ -157,7 +177,7 @@ func (fr *framer) writeOnce(p []byte) (n int, err error) {
 
 // readPacket is pass-through for boundary-preserving transports.
 // ReadLimit is checked after each transport read, so ErrTooLong can be returned
-// with n > limit; n is still the consumed-byte count for this call.
+// with n > limit; n is still the bytes-copied count for this call.
 func (fr *framer) readPacket(p []byte) (n int, err error) {
 	n, err = fr.readOnce(p)
 	if fr.readLimit > 0 && int64(n) > fr.readLimit {
@@ -171,13 +191,193 @@ func (fr *framer) writePacket(p []byte) (n int, err error) {
 		return 0, ErrTooLong
 	}
 	n, err = fr.writeOnce(p)
-	if err != nil {
+	if n < 0 || n > len(p) {
+		return 0, io.ErrShortWrite
+	}
+	if n == len(p) {
 		return n, err
 	}
-	if n != len(p) {
-		return n, io.ErrShortWrite
+	if n == 0 {
+		if err != nil {
+			return 0, err
+		}
+		return 0, io.ErrShortWrite
+	}
+	return n, io.ErrShortWrite
+}
+
+type byteCursor struct {
+	off int
+	end int
+}
+
+func drainByteCursor(cur *byteCursor, msg []byte, dst io.Writer) (n int, err error) {
+	for cur.off < cur.end {
+		wn, we := dst.Write(msg[cur.off:cur.end])
+		if wn < 0 || wn > cur.end-cur.off {
+			return n, io.ErrShortWrite
+		}
+		if wn > 0 {
+			cur.off += wn
+			n += wn
+		}
+		if we != nil {
+			return n, we
+		}
+		if wn == 0 {
+			return n, io.ErrShortWrite
+		}
 	}
 	return n, nil
+}
+
+func packetTransferAcceptedMax(fr *framer) int {
+	if fr.readLimit > 0 {
+		return int(fr.readLimit)
+	}
+	return defaultPacketTransferMax
+}
+
+func packetTransferCap(fr *framer) (int, error) {
+	acceptedMax := packetTransferAcceptedMax(fr)
+	if acceptedMax >= maxInt() {
+		return 0, ErrTooLong
+	}
+	return acceptedMax + 1, nil
+}
+
+func maxInt() int {
+	return int(^uint(0) >> 1)
+}
+
+func (fr *framer) ensurePacketReadBuffer() ([]byte, int, error) {
+	capHint, err := packetTransferCap(fr)
+	if err != nil {
+		return nil, 0, err
+	}
+	if cap(fr.rbuf) < capHint {
+		fr.rbuf = make([]byte, capHint)
+	}
+	return fr.rbuf[:capHint], packetTransferAcceptedMax(fr), nil
+}
+
+func (fr *framer) ensureStreamReadBuffer() []byte {
+	if fr.rbuf == nil {
+		capHint := int(fr.readLimit)
+		if capHint <= 0 {
+			capHint = defaultPacketTransferMax
+		}
+		fr.rbuf = make([]byte, capHint)
+	}
+	return fr.rbuf
+}
+
+func (fr *framer) ensureForwardBufferCap() (int, int, error) {
+	if fr.rpr.preserveBoundary() {
+		capHint, err := packetTransferCap(fr)
+		if err != nil {
+			return 0, 0, err
+		}
+		return capHint, packetTransferAcceptedMax(fr), nil
+	}
+	capHint := int(fr.readLimit)
+	if capHint <= 0 {
+		capHint = defaultPacketTransferMax
+	}
+	return capHint, capHint, nil
+}
+
+func (fr *framer) ensureReadFromBuffer() []byte {
+	if fr.wbuf == nil {
+		fr.wbuf = make([]byte, 32*1024)
+	}
+	return fr.wbuf
+}
+
+func isSemanticControl(err error) bool {
+	return err == ErrWouldBlock || err == ErrMore
+}
+
+func clearWriteToPending(fr *framer) {
+	fr.wtMode = writeToNone
+	fr.wtOff = 0
+	fr.wtLen = 0
+	fr.wtAfter = nil
+}
+
+func saveWriteToByteCursor(fr *framer, off, end int, after error) {
+	fr.wtMode = writeToByte
+	fr.wtOff = off
+	fr.wtLen = end
+	fr.wtAfter = after
+}
+
+func saveWriteToPacket(fr *framer, end int, after error) {
+	fr.wtMode = writeToPacket
+	fr.wtOff = 0
+	fr.wtLen = end
+	fr.wtAfter = after
+}
+
+func saveWriteToFrame(fr *framer, end int, after error) {
+	fr.wtMode = writeToFrame
+	fr.wtOff = 0
+	fr.wtLen = end
+	fr.wtAfter = after
+}
+
+func saveWriteToControl(fr *framer, after error) {
+	fr.wtMode = writeToControl
+	fr.wtOff = 0
+	fr.wtLen = 0
+	fr.wtAfter = after
+}
+
+func reportWriteToAfter(after error) (err error, done bool) {
+	if after == nil {
+		return nil, false
+	}
+	if after == io.EOF {
+		return nil, true
+	}
+	return after, true
+}
+
+func finishWriteToAfter(fr *framer) (err error, done bool) {
+	after := fr.wtAfter
+	clearWriteToPending(fr)
+	return reportWriteToAfter(after)
+}
+
+func clearReadFromPending(fr *framer) {
+	fr.rfLen = 0
+	fr.rfAfter = nil
+}
+
+func saveReadFromPending(fr *framer, end int, after error) {
+	fr.rfLen = end
+	fr.rfAfter = after
+}
+
+func saveReadFromControl(fr *framer, after error) {
+	fr.rfLen = 0
+	fr.rfAfter = after
+}
+
+func hasReadFromControl(fr *framer) bool {
+	return fr.rfLen == 0 && fr.rfAfter != nil
+}
+
+func finishReadFromPending(fr *framer) (err error, done bool) {
+	after := fr.rfAfter
+	clearReadFromPending(fr)
+	if after == nil {
+		return nil, false
+	}
+	if after == io.EOF {
+		return nil, true
+	}
+	return after, true
 }
 
 func (fr *framer) readStream(p []byte) (n int, err error) {
