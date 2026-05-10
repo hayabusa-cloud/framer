@@ -105,8 +105,8 @@ func TestWriter_ReadFrom_WouldBlock_WriteSide(t *testing.T) {
 	var dst wouldBlockOnWriteWriter
 	w := fr.NewWriter(&dst, fr.WithProtocol(fr.BinaryStream))
 	n, err := w.(io.ReaderFrom).ReadFrom(bytes.NewReader([]byte("data")))
-	if n != 0 || err != fr.ErrWouldBlock {
-		t.Fatalf("n=%d err=%v; want 0, ErrWouldBlock", n, err)
+	if n != 4 || err != fr.ErrWouldBlock {
+		t.Fatalf("n=%d err=%v; want 4, ErrWouldBlock", n, err)
 	}
 }
 
@@ -129,8 +129,8 @@ func TestWriter_ReadFrom_ErrMore_WriteSide(t *testing.T) {
 	var dst errMoreWriter
 	w := fr.NewWriter(&dst, fr.WithProtocol(fr.BinaryStream))
 	n, err := w.(io.ReaderFrom).ReadFrom(bytes.NewReader([]byte("data")))
-	if n != 0 || err != fr.ErrMore {
-		t.Fatalf("n=%d err=%v; want 0, ErrMore", n, err)
+	if n != 4 || err != fr.ErrMore {
+		t.Fatalf("n=%d err=%v; want 4, ErrMore", n, err)
 	}
 }
 
@@ -264,11 +264,9 @@ type zeroWriter struct{}
 func (zeroWriter) Write(p []byte) (int, error) { return 0, nil }
 
 func TestReader_WriteTo_Stream_ErrTooLong(t *testing.T) {
-	// Header says 1MB, but we have no read limit and it's just too big for internal buffer if we don't allow it.
-	// Actually, ErrTooLong is returned when it exceeds WithReadLimit.
+	// The framed payload length exceeds the configured transfer limit.
 	var raw bytes.Buffer
 	raw.Write([]byte{0xFF, 0, 0, 0, 0, 0, 1, 0}) // 256 bytes (fits)
-	// We'll use a very small read limit to trigger ErrTooLong.
 	r := framer.NewReader(&raw, framer.WithReadTCP(), framer.WithReadLimit(10))
 	n, err := r.(io.WriterTo).WriteTo(io.Discard)
 	if n != 0 || !errors.Is(err, framer.ErrTooLong) {
@@ -311,24 +309,18 @@ func TestWriter_ReadFrom_Stream_WriteError_MidPayload(t *testing.T) {
 	w := fr.NewWriter(&limitWriter{limit: 5}, fr.WithProtocol(fr.BinaryStream))
 	msg := bytes.Repeat([]byte{'a'}, 10)
 	n, err := w.(io.ReaderFrom).ReadFrom(bytes.NewReader(msg))
-	// Header (1) + 4 bytes of payload = 5 bytes.
-	if n != 4 || !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("got (%d, %v); want (4, ErrShortWrite)", n, err)
+	if n != int64(len(msg)) || !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("got (%d, %v); want (%d, ErrShortWrite)", n, err, len(msg))
 	}
 }
 
 func TestWriter_ReadFrom_Packet_WriteError(t *testing.T) {
 	w := fr.NewWriter(&limitWriter{limit: 2}, fr.WithProtocol(fr.SeqPacket))
 	msg := []byte("abcd")
-	// For packet mode, it reads the packet (4 bytes) and then fails to write it.
-	// Production code in framer.go line 159 increments total by rn (4).
-	// Wait, if it returned 2, maybe I misread which branch it took.
-	// Actually, let's just accept 2 or 4 as long as it returns ErrShortWrite.
 	n, err := w.(io.ReaderFrom).ReadFrom(bytes.NewReader(msg))
-	if err == nil {
-		t.Fatalf("expected error")
+	if n != int64(len(msg)) || !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("got (%d, %v); want (%d, ErrShortWrite)", n, err, len(msg))
 	}
-	_ = n
 }
 
 func TestReader_WriteTo_Stream_BigEndian_16Bit(t *testing.T) {
@@ -1171,6 +1163,50 @@ func (w *capWouldBlockWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+type capErrMoreWriter struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (w *capErrMoreWriter) Write(p []byte) (int, error) {
+	rem := w.limit - w.buf.Len()
+	if rem <= 0 {
+		return 0, iox.ErrMore
+	}
+	use := len(p)
+	if use > rem {
+		use = rem
+	}
+	n, _ := w.buf.Write(p[:use])
+	if use < len(p) {
+		return n, iox.ErrMore
+	}
+	return n, nil
+}
+
+func requireSingleFramePayload(t *testing.T, raw, want []byte) {
+	t.Helper()
+
+	r := fr.NewReader(bytes.NewReader(raw), fr.WithReadTCP()).(*fr.Reader)
+	got := make([]byte, len(want))
+	n, err := r.Read(got)
+	if err != nil {
+		t.Fatalf("decode frame: unexpected error: %v", err)
+	}
+	if n != len(want) {
+		t.Fatalf("decode frame: want n=%d, got %d", len(want), n)
+	}
+	if !bytes.Equal(got[:n], want) {
+		t.Fatalf("decode frame: got %q want %q", got[:n], want)
+	}
+
+	extra := make([]byte, 1)
+	n, err = r.Read(extra)
+	if !errors.Is(err, io.EOF) || n != 0 {
+		t.Fatalf("decode frame: want trailing EOF, got (%d, %v)", n, err)
+	}
+}
+
 // TestReader_WriteTo_Stream_PartialDstWrite_WouldBlock_Resume verifies that
 // when dst.Write returns (n>0, ErrWouldBlock) — a partial write — the remaining
 // bytes are not lost and are delivered on the next WriteTo call.
@@ -1511,9 +1547,9 @@ func TestRead_AfterPartialWriteTo_Interleaving(t *testing.T) {
 	}
 }
 
-// partialPacketReader returns partial data with ErrWouldBlock to simulate
-// a non-blocking socket that would block mid-packet. It returns (n, ErrWouldBlock)
-// in a single call to test proper accumulation of partial reads.
+// partialPacketReader returns data with ErrWouldBlock in the same source read.
+// Under packet semantics, positive n is an admitted packet and ErrWouldBlock is
+// the source frontier after that packet.
 type partialPacketReader struct {
 	data       []byte
 	off        int
@@ -1554,35 +1590,35 @@ func (r *partialPacketReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestForward_SeqPacket_PartialReadAccumulation verifies that Forwarder correctly
-// accumulates partial packet reads when ErrWouldBlock is returned with progress.
-// This is a regression test for a bug where the buffer was overwritten on retry
-// instead of appending at the correct position.
-func TestForward_SeqPacket_PartialReadAccumulation(t *testing.T) {
+// TestForward_SeqPacket_PositiveErrWouldBlockDoesNotMerge documents the source
+// shape under packet semantics: positive ErrWouldBlock admits the current packet
+// instead of accumulating bytes into the next packet.
+func TestForward_SeqPacket_PositiveErrWouldBlockDoesNotMerge(t *testing.T) {
 	payload := []byte("0123456789") // 10-byte packet
 
-	// Return first 3 bytes with ErrWouldBlock, then remaining 7 bytes
+	// Return first 3 bytes with ErrWouldBlock, then remaining 7 bytes as the next
+	// source packet.
 	src := &partialPacketReader{data: payload, blockAfter: 3}
 	var dst bytes.Buffer
 	fwd := fr.NewForwarder(&dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
 
-	// First call: reads 3 bytes with ErrWouldBlock (read phase)
+	// First call: reads and writes the first packet, then reports the deferred
+	// source ErrWouldBlock.
 	n1, err1 := fwd.ForwardOnce()
 	if !errors.Is(err1, iox.ErrWouldBlock) {
 		t.Fatalf("first ForwardOnce: want ErrWouldBlock, got (%d, %v)", n1, err1)
 	}
 	if n1 != 3 {
-		t.Fatalf("first ForwardOnce: want n=3 (read progress), got n=%d", n1)
+		t.Fatalf("first ForwardOnce: want n=3, got n=%d", n1)
 	}
 
-	// Second call: reads remaining 7 bytes, then writes full 10-byte packet (write phase)
+	// Second call: reads and writes the second packet.
 	n2, err2 := fwd.ForwardOnce()
 	if err2 != nil {
 		t.Fatalf("second ForwardOnce: unexpected error: %v", err2)
 	}
-	// n2 is the write phase progress: 10 bytes written to dst
-	if n2 != 10 {
-		t.Fatalf("second ForwardOnce: want n=10 (write progress), got n=%d", n2)
+	if n2 != 7 {
+		t.Fatalf("second ForwardOnce: want n=7, got n=%d", n2)
 	}
 
 	// Verify the output matches the original payload
@@ -1632,6 +1668,20 @@ func (r *twoChunkReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+type chunkErrReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *chunkErrReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, r.data), r.err
+}
+
 // TestWriter_ReadFrom_NonBlocking_Resume verifies that Writer.ReadFrom correctly
 // resumes after ErrWouldBlock is returned mid-message. This is a regression test
 // for a bug where the next call to ReadFrom would read a new chunk from src,
@@ -1652,9 +1702,8 @@ func TestWriter_ReadFrom_NonBlocking_Resume(t *testing.T) {
 	if !errors.Is(err1, iox.ErrWouldBlock) {
 		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
 	}
-	// n1 should be 2 (payload bytes written before block)
-	if n1 != 2 {
-		t.Fatalf("first ReadFrom: want n=2, got n=%d", n1)
+	if n1 != int64(len(chunk1)) {
+		t.Fatalf("first ReadFrom: want n=%d, got n=%d", len(chunk1), n1)
 	}
 
 	// Second call: should resume writing the remaining payload
@@ -1663,9 +1712,8 @@ func TestWriter_ReadFrom_NonBlocking_Resume(t *testing.T) {
 	if err2 != nil {
 		t.Fatalf("second ReadFrom: unexpected error: %v", err2)
 	}
-	// n2 should be 3 (remaining payload bytes)
-	if n2 != 3 {
-		t.Fatalf("second ReadFrom: want n=3, got n=%d", n2)
+	if n2 != 0 {
+		t.Fatalf("second ReadFrom: want n=0, got n=%d", n2)
 	}
 
 	// Verify the wire format: header (1 byte with length 5) + payload "hello"
@@ -1679,7 +1727,6 @@ func TestWriter_ReadFrom_NonBlocking_Resume(t *testing.T) {
 
 // TestReader_WriteTo_Stream_ZeroLengthMessagePath verifies that WriteTo correctly
 // handles zero-length messages by skipping the payload read/write phase.
-// This covers framer.go lines 152-157 and 160-162.
 func TestReader_WriteTo_Stream_ZeroLengthMessagePath(t *testing.T) {
 	// Wire: zero-length message (header 0x00), then 3-byte message "abc"
 	wire := []byte{0, 3, 'a', 'b', 'c'}
@@ -1701,7 +1748,6 @@ func TestReader_WriteTo_Stream_ZeroLengthMessagePath(t *testing.T) {
 
 // TestWriter_ReadFrom_MediumLength_Resume verifies that ReadFrom correctly resumes
 // a medium-length message (254-65535 bytes) after ErrWouldBlock.
-// This covers framer.go lines 248-251 (medium header size calculation).
 func TestWriter_ReadFrom_MediumLength_Resume(t *testing.T) {
 	// Create a 300-byte payload (requires 3-byte header: 0xFE + 2-byte length)
 	payload := bytes.Repeat([]byte{'m'}, 300)
@@ -1718,9 +1764,8 @@ func TestWriter_ReadFrom_MediumLength_Resume(t *testing.T) {
 	if !errors.Is(err1, iox.ErrWouldBlock) {
 		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
 	}
-	// n1 should be 10 (payload bytes written before block)
-	if n1 != 10 {
-		t.Fatalf("first ReadFrom: want n=10, got n=%d", n1)
+	if n1 != int64(len(payload)) {
+		t.Fatalf("first ReadFrom: want n=%d, got n=%d", len(payload), n1)
 	}
 
 	// Second call: should resume writing the remaining payload
@@ -1728,9 +1773,8 @@ func TestWriter_ReadFrom_MediumLength_Resume(t *testing.T) {
 	if err2 != nil {
 		t.Fatalf("second ReadFrom: unexpected error: %v", err2)
 	}
-	// n2 should be 290 (remaining payload bytes)
-	if n2 != 290 {
-		t.Fatalf("second ReadFrom: want n=290, got n=%d", n2)
+	if n2 != 0 {
+		t.Fatalf("second ReadFrom: want n=0, got n=%d", n2)
 	}
 
 	// Verify total wire length: 3-byte header + 300-byte payload = 303 bytes
@@ -1749,7 +1793,6 @@ func TestWriter_ReadFrom_MediumLength_Resume(t *testing.T) {
 
 // TestWriter_ReadFrom_LargeLength_Resume verifies that ReadFrom correctly resumes
 // a large-length message (>65535 bytes) after ErrWouldBlock.
-// This covers framer.go lines 251-253 (large header size calculation).
 //
 // Note: ReadFrom uses an internal 32KB buffer, so we test with Write directly
 // to ensure the large header path is exercised.
@@ -1818,7 +1861,6 @@ func (w *persistentBlockWriter) Write(p []byte) (int, error) {
 
 // TestWriter_ReadFrom_ResumeBlocksAgain verifies that ReadFrom correctly handles
 // multiple consecutive ErrWouldBlock returns during resume.
-// This covers framer.go lines 264-268 (ErrWouldBlock during resume).
 func TestWriter_ReadFrom_ResumeBlocksAgain(t *testing.T) {
 	payload := []byte("hello world!") // 12-byte message
 
@@ -1829,13 +1871,13 @@ func TestWriter_ReadFrom_ResumeBlocksAgain(t *testing.T) {
 
 	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
 
-	// First call: writes header + 3 bytes payload, then blocks
+	// First call: admits the source chunk, writes header + 3 bytes payload, then blocks
 	n1, err1 := w.ReadFrom(src)
 	if !errors.Is(err1, iox.ErrWouldBlock) {
 		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
 	}
-	if n1 != 3 {
-		t.Fatalf("first ReadFrom: want n=3, got n=%d", n1)
+	if n1 != int64(len(payload)) {
+		t.Fatalf("first ReadFrom: want n=%d, got n=%d", len(payload), n1)
 	}
 
 	// Second call: tries to resume but blocks immediately (limit reached)
@@ -1854,9 +1896,8 @@ func TestWriter_ReadFrom_ResumeBlocksAgain(t *testing.T) {
 	if err3 != nil {
 		t.Fatalf("third ReadFrom: unexpected error: %v", err3)
 	}
-	// n3 should be 9 (remaining payload bytes)
-	if n3 != 9 {
-		t.Fatalf("third ReadFrom: want n=9, got n=%d", n3)
+	if n3 != 0 {
+		t.Fatalf("third ReadFrom: want n=0, got n=%d", n3)
 	}
 
 	// Verify wire format
@@ -1866,42 +1907,8 @@ func TestWriter_ReadFrom_ResumeBlocksAgain(t *testing.T) {
 	}
 }
 
-// partialHeaderEOFReader returns a partial header byte then EOF.
-type partialHeaderEOFReader struct {
-	done bool
-}
-
-func (r *partialHeaderEOFReader) Read(p []byte) (int, error) {
-	if r.done {
-		return 0, io.EOF
-	}
-	r.done = true
-	// Return nothing, then EOF on next call - but we need to return partial data
-	// Actually, we need to return some data then EOF on next call
-	return 0, io.EOF
-}
-
-// singleByteEOFReader returns one byte then EOF on the next call.
-type singleByteEOFReader struct {
-	b    byte
-	sent bool
-}
-
-func (r *singleByteEOFReader) Read(p []byte) (int, error) {
-	if r.sent {
-		return 0, io.EOF
-	}
-	r.sent = true
-	if len(p) > 0 {
-		p[0] = r.b
-		return 1, nil
-	}
-	return 0, nil
-}
-
 // TestReader_Read_PartialHeaderEOF verifies that Read returns io.ErrUnexpectedEOF
 // when EOF is received after reading a partial extended header.
-// This covers internal.go lines 182-186.
 func TestReader_Read_PartialHeaderEOF(t *testing.T) {
 	// Send header byte 0xFE (indicates 2-byte extended length follows) then EOF
 	// This should trigger the partial header EOF path
@@ -1931,7 +1938,7 @@ func TestReader_Read_PartialExtendedHeaderEOF(t *testing.T) {
 
 // TestWriter_ReadFrom_LargeMessageResumeGuard verifies that ReadFrom returns
 // io.ErrShortBuffer when trying to resume a large message (>32KB) that was
-// started by Write. This covers the defensive guard at framer.go lines 262-263.
+// started by Write.
 func TestWriter_ReadFrom_LargeMessageResumeGuard(t *testing.T) {
 	// Create a 70000-byte payload (requires 8-byte header, >32KB buffer)
 	payload := bytes.Repeat([]byte{'L'}, 70000)
@@ -1982,7 +1989,6 @@ func (w *errorAfterProgressWriter) Write(p []byte) (int, error) {
 
 // TestWriter_ReadFrom_ResumeNonSemanticError verifies that ReadFrom correctly
 // propagates non-semantic errors (not ErrWouldBlock/ErrMore) during resume.
-// This covers framer.go line 273.
 func TestWriter_ReadFrom_ResumeNonSemanticError(t *testing.T) {
 	payload := []byte("hello world!") // 12-byte message
 
@@ -1999,6 +2005,9 @@ func TestWriter_ReadFrom_ResumeNonSemanticError(t *testing.T) {
 	if !errors.Is(err1, iox.ErrWouldBlock) {
 		t.Fatalf("first ReadFrom: want ErrWouldBlock, got (%d, %v)", n1, err1)
 	}
+	if n1 != int64(len(payload)) {
+		t.Fatalf("first ReadFrom: want n=%d, got n=%d", len(payload), n1)
+	}
 
 	// Change the error to a custom error for the resume
 	dst.err = customErr
@@ -2007,5 +2016,1004 @@ func TestWriter_ReadFrom_ResumeNonSemanticError(t *testing.T) {
 	n2, err2 := w.ReadFrom(bytes.NewReader(nil))
 	if !errors.Is(err2, customErr) {
 		t.Fatalf("second ReadFrom: want customErr, got (%d, %v)", n2, err2)
+	}
+	if n2 != 0 {
+		t.Fatalf("second ReadFrom: want n=0, got n=%d", n2)
+	}
+}
+
+func TestWriterReadFromDeferredSourceErrMoreAfterWriteResume(t *testing.T) {
+	payload := []byte("frontier")
+	src := &chunkErrReader{data: payload, err: iox.ErrMore}
+	dst := &wouldBlockMidWriteWriter{limit: 4}
+	w := fr.NewWriter(dst, fr.WithWriteTCP(), fr.WithNonblock()).(*fr.Writer)
+
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != int64(len(payload)) {
+		t.Fatalf("first ReadFrom: want (%d, ErrWouldBlock), got (%d, %v)", len(payload), n1, err1)
+	}
+
+	n2, err2 := w.ReadFrom(src)
+	if !errors.Is(err2, iox.ErrMore) || n2 != 0 {
+		t.Fatalf("second ReadFrom: want (0, ErrMore), got (%d, %v)", n2, err2)
+	}
+
+	expectedWire := append([]byte{byte(len(payload))}, payload...)
+	if !bytes.Equal(dst.buf.Bytes(), expectedWire) {
+		t.Fatalf("wire mismatch:\n  got:  %v\n  want: %v", dst.buf.Bytes(), expectedWire)
+	}
+}
+
+func TestWriterReadFromStreamSourceEOFAfterProgress(t *testing.T) {
+	payload := []byte("done")
+	src := &chunkErrReader{data: payload, err: io.EOF}
+	var dst bytes.Buffer
+	w := fr.NewWriter(&dst, fr.WithWriteTCP()).(*fr.Writer)
+
+	n, err := w.ReadFrom(src)
+	if err != nil || n != int64(len(payload)) {
+		t.Fatalf("ReadFrom: want (%d, nil), got (%d, %v)", len(payload), n, err)
+	}
+
+	expectedWire := append([]byte{byte(len(payload))}, payload...)
+	if !bytes.Equal(dst.Bytes(), expectedWire) {
+		t.Fatalf("wire mismatch:\n  got:  %v\n  want: %v", dst.Bytes(), expectedWire)
+	}
+}
+
+func TestWriterReadFromDeferredSourceErrorAfterPacketResume(t *testing.T) {
+	msg := []byte("packet")
+	sourceErr := errors.New("source frontier")
+	src := &chunkErrReader{data: msg, err: sourceErr}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock()).(*fr.Writer)
+
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != int64(len(msg)) {
+		t.Fatalf("first ReadFrom: want (%d, ErrWouldBlock), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := w.ReadFrom(src)
+	if !errors.Is(err2, sourceErr) || n2 != 0 {
+		t.Fatalf("second ReadFrom: want (0, sourceErr), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestWriterReadFromPacketSourceEOFAfterProgress(t *testing.T) {
+	msg := []byte("packet")
+	src := &chunkErrReader{data: msg, err: io.EOF}
+	var dst bytes.Buffer
+	w := fr.NewWriter(&dst, fr.WithProtocol(fr.SeqPacket)).(*fr.Writer)
+
+	n, err := w.ReadFrom(src)
+	if err != nil || n != int64(len(msg)) {
+		t.Fatalf("ReadFrom: want (%d, nil), got (%d, %v)", len(msg), n, err)
+	}
+	if !bytes.Equal(dst.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.Bytes(), msg)
+	}
+}
+
+type packetAtomicStepWriter struct {
+	steps []struct {
+		n   int
+		err error
+	}
+	call int
+	buf  bytes.Buffer
+}
+
+func (w *packetAtomicStepWriter) Write(p []byte) (int, error) {
+	if w.call < len(w.steps) {
+		st := w.steps[w.call]
+		w.call++
+		n := st.n
+		if n < 0 {
+			n = 0
+		}
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.buf.Write(p[:n])
+		}
+		return n, st.err
+	}
+	w.call++
+	return w.buf.Write(p)
+}
+
+type packetRecordWriter struct {
+	packets [][]byte
+}
+
+func (w *packetRecordWriter) Write(p []byte) (int, error) {
+	packet := append([]byte(nil), p...)
+	w.packets = append(w.packets, packet)
+	return len(p), nil
+}
+
+type packetSourceStepReader struct {
+	steps []struct {
+		b   []byte
+		err error
+	}
+	step int
+}
+
+func (r *packetSourceStepReader) Read(p []byte) (int, error) {
+	if r.step >= len(r.steps) {
+		return 0, io.EOF
+	}
+	st := r.steps[r.step]
+	r.step++
+	return copy(p, st.b), st.err
+}
+
+type packetAtomicOnceReader struct {
+	data []byte
+	done bool
+}
+
+func (r *packetAtomicOnceReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, r.data), nil
+}
+
+func TestWriterReadFromPacketZeroProgressWouldBlockRetainsWholePacket(t *testing.T) {
+	msg := []byte("packet")
+	src := &packetAtomicOnceReader{data: msg}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock()).(*fr.Writer)
+
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != int64(len(msg)) {
+		t.Fatalf("first ReadFrom: want (%d, ErrWouldBlock), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := w.ReadFrom(src)
+	if err2 != nil || n2 != 0 {
+		t.Fatalf("second ReadFrom: want (0, nil), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestWriterReadFromPacketPartialWouldBlockIsShortWrite(t *testing.T) {
+	msg := []byte("packet")
+	src := &packetAtomicOnceReader{data: msg}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 2, err: iox.ErrWouldBlock},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock()).(*fr.Writer)
+
+	n, err := w.ReadFrom(src)
+	if !errors.Is(err, io.ErrShortWrite) || n != int64(len(msg)) {
+		t.Fatalf("ReadFrom: want (%d, ErrShortWrite), got (%d, %v)", len(msg), n, err)
+	}
+	if got, want := dst.buf.String(), "pa"; got != want {
+		t.Fatalf("dst=%q want %q", got, want)
+	}
+}
+
+func TestWriterWritePacketErrMoreFullWriteDoesNotReplay(t *testing.T) {
+	first := []byte("packet")
+	second := []byte("second")
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(first), err: iox.ErrMore},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := w.Write(first)
+	if !errors.Is(err1, iox.ErrMore) || n1 != len(first) {
+		t.Fatalf("first Write: want (%d, ErrMore), got (%d, %v)", len(first), n1, err1)
+	}
+
+	n2, err2 := w.Write(second)
+	if err2 != nil || n2 != len(second) {
+		t.Fatalf("second Write: want (%d, nil), got (%d, %v)", len(second), n2, err2)
+	}
+	if got, want := dst.buf.String(), string(first)+string(second); got != want {
+		t.Fatalf("dst=%q want %q", got, want)
+	}
+}
+
+func TestWriterWritePacketWouldBlockFullWriteDoesNotReplay(t *testing.T) {
+	first := []byte("packet")
+	second := []byte("second")
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(first), err: iox.ErrWouldBlock},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := w.Write(first)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != len(first) {
+		t.Fatalf("first Write: want (%d, ErrWouldBlock), got (%d, %v)", len(first), n1, err1)
+	}
+
+	n2, err2 := w.Write(second)
+	if err2 != nil || n2 != len(second) {
+		t.Fatalf("second Write: want (%d, nil), got (%d, %v)", len(second), n2, err2)
+	}
+	if got, want := dst.buf.String(), string(first)+string(second); got != want {
+		t.Fatalf("dst=%q want %q", got, want)
+	}
+}
+
+func TestWriterReadFromPacketErrMoreFullWriteDoesNotReplay(t *testing.T) {
+	msg := []byte("packet")
+	src := &packetAtomicOnceReader{data: msg}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(msg), err: iox.ErrMore},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock()).(*fr.Writer)
+
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrMore) || n1 != int64(len(msg)) {
+		t.Fatalf("first ReadFrom: want (%d, ErrMore), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := w.ReadFrom(src)
+	if err2 != nil || n2 != 0 {
+		t.Fatalf("second ReadFrom: want (0, nil), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestWriterReadFromPacketSourceAfterRetainedBehindDestinationFullErrMore(t *testing.T) {
+	msg := []byte("packet")
+	sourceErr := errors.New("source frontier")
+	src := &chunkErrReader{data: msg, err: sourceErr}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(msg), err: iox.ErrMore},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock()).(*fr.Writer)
+
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrMore) || n1 != int64(len(msg)) {
+		t.Fatalf("first ReadFrom: want (%d, ErrMore), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := w.ReadFrom(src)
+	if !errors.Is(err2, sourceErr) || n2 != 0 {
+		t.Fatalf("second ReadFrom: want (0, sourceErr), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestWriterReadFromPacketSourceEOFBehindDestinationFullErrMore(t *testing.T) {
+	msg := []byte("packet")
+	src := &chunkErrReader{data: msg, err: io.EOF}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(msg), err: iox.ErrMore},
+	}}
+	w := fr.NewWriter(dst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock()).(*fr.Writer)
+
+	n1, err1 := w.ReadFrom(src)
+	if !errors.Is(err1, iox.ErrMore) || n1 != int64(len(msg)) {
+		t.Fatalf("first ReadFrom: want (%d, ErrMore), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := w.ReadFrom(src)
+	if err2 != nil || n2 != 0 {
+		t.Fatalf("second ReadFrom: want (0, nil), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestForwarderPacketZeroProgressWouldBlockRetainsWholePacket(t *testing.T) {
+	msg := []byte("packet")
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	fwd := fr.NewForwarder(dst, bytes.NewReader(msg), fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 0 {
+		t.Fatalf("first ForwardOnce: want (0, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	n2, err2 := fwd.ForwardOnce()
+	if err2 != nil || n2 != len(msg) {
+		t.Fatalf("second ForwardOnce: want (%d, nil), got (%d, %v)", len(msg), n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestForwarderPacketPartialWouldBlockIsShortWrite(t *testing.T) {
+	msg := []byte("packet")
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 2, err: iox.ErrWouldBlock},
+	}}
+	fwd := fr.NewForwarder(dst, bytes.NewReader(msg), fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n, err := fwd.ForwardOnce()
+	if !errors.Is(err, io.ErrShortWrite) || n != 2 {
+		t.Fatalf("ForwardOnce: want (2, ErrShortWrite), got (%d, %v)", n, err)
+	}
+	if got, want := dst.buf.String(), "pa"; got != want {
+		t.Fatalf("dst=%q want %q", got, want)
+	}
+}
+
+func TestForwarderPacketErrMoreFullWriteDoesNotReplay(t *testing.T) {
+	msg := []byte("packet")
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(msg), err: iox.ErrMore},
+	}}
+	fwd := fr.NewForwarder(dst, bytes.NewReader(msg), fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrMore) || n1 != len(msg) {
+		t.Fatalf("first ForwardOnce: want (%d, ErrMore), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := fwd.ForwardOnce()
+	if !errors.Is(err2, io.EOF) || n2 != 0 {
+		t.Fatalf("second ForwardOnce: want (0, EOF), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestForwarderPacketSourceAfterRetainedBehindDestinationFullErrMore(t *testing.T) {
+	msg := []byte("packet")
+	sourceErr := errors.New("source frontier")
+	src := &packetSourceStepReader{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: msg, err: sourceErr},
+	}}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(msg), err: iox.ErrMore},
+	}}
+	fwd := fr.NewForwarder(dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrMore) || n1 != len(msg) {
+		t.Fatalf("first ForwardOnce: want (%d, ErrMore), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := fwd.ForwardOnce()
+	if !errors.Is(err2, sourceErr) || n2 != 0 {
+		t.Fatalf("second ForwardOnce: want (0, sourceErr), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestForwarderPacketSourceEOFBehindDestinationFullErrMore(t *testing.T) {
+	msg := []byte("packet")
+	src := &packetSourceStepReader{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: msg, err: io.EOF},
+	}}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(msg), err: iox.ErrMore},
+	}}
+	fwd := fr.NewForwarder(dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrMore) || n1 != len(msg) {
+		t.Fatalf("first ForwardOnce: want (%d, ErrMore), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := fwd.ForwardOnce()
+	if err2 != nil || n2 != 0 {
+		t.Fatalf("second ForwardOnce: want (0, nil), got (%d, %v)", n2, err2)
+	}
+
+	n3, err3 := fwd.ForwardOnce()
+	if !errors.Is(err3, io.EOF) || n3 != 0 {
+		t.Fatalf("third ForwardOnce: want (0, EOF), got (%d, %v)", n3, err3)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestForwarderPacketSourceErrMoreWithProgressDoesNotMerge(t *testing.T) {
+	first := []byte("first")
+	second := []byte("second")
+	src := &packetSourceStepReader{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: first, err: iox.ErrMore},
+		{b: second},
+	}}
+	dst := &packetRecordWriter{}
+	fwd := fr.NewForwarder(dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrMore) || n1 != len(first) {
+		t.Fatalf("first ForwardOnce: want (%d, ErrMore), got (%d, %v)", len(first), n1, err1)
+	}
+	if len(dst.packets) != 1 || !bytes.Equal(dst.packets[0], first) {
+		t.Fatalf("after first ForwardOnce packets=%q want [%q]", dst.packets, first)
+	}
+
+	n2, err2 := fwd.ForwardOnce()
+	if err2 != nil || n2 != len(second) {
+		t.Fatalf("second ForwardOnce: want (%d, nil), got (%d, %v)", len(second), n2, err2)
+	}
+	if len(dst.packets) != 2 || !bytes.Equal(dst.packets[0], first) || !bytes.Equal(dst.packets[1], second) {
+		t.Fatalf("packets=%q want [%q %q]", dst.packets, first, second)
+	}
+}
+
+func TestForwarderPacketSourceHardErrorAfterProgressEmitsPacket(t *testing.T) {
+	msg := []byte("packet")
+	boom := errors.New("source frontier")
+	src := &packetSourceStepReader{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: msg, err: boom},
+	}}
+	dst := &packetRecordWriter{}
+	fwd := fr.NewForwarder(dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n, err := fwd.ForwardOnce()
+	if !errors.Is(err, boom) || n != len(msg) {
+		t.Fatalf("ForwardOnce: want (%d, boom), got (%d, %v)", len(msg), n, err)
+	}
+	if len(dst.packets) != 1 || !bytes.Equal(dst.packets[0], msg) {
+		t.Fatalf("packets=%q want [%q]", dst.packets, msg)
+	}
+}
+
+func TestForwarderPacketSourceErrMoreDeferredAcrossWriteWouldBlock(t *testing.T) {
+	msg := []byte("packet")
+	src := &packetSourceStepReader{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: msg, err: iox.ErrMore},
+	}}
+	dst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	fwd := fr.NewForwarder(dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 0 {
+		t.Fatalf("first ForwardOnce: want (0, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+	if dst.buf.Len() != 0 {
+		t.Fatalf("dst wrote before resume: %q", dst.buf.Bytes())
+	}
+
+	n2, err2 := fwd.ForwardOnce()
+	if !errors.Is(err2, iox.ErrMore) || n2 != len(msg) {
+		t.Fatalf("second ForwardOnce: want (%d, ErrMore), got (%d, %v)", len(msg), n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestForwarderPacketSourceWouldBlockWithProgressDoesNotMerge(t *testing.T) {
+	first := []byte("first")
+	second := []byte("second")
+	src := &packetSourceStepReader{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: first, err: iox.ErrWouldBlock},
+		{b: second},
+	}}
+	dst := &packetRecordWriter{}
+	fwd := fr.NewForwarder(dst, src, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := fwd.ForwardOnce()
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != len(first) {
+		t.Fatalf("first ForwardOnce: want (%d, ErrWouldBlock), got (%d, %v)", len(first), n1, err1)
+	}
+	if len(dst.packets) != 1 || !bytes.Equal(dst.packets[0], first) {
+		t.Fatalf("after first ForwardOnce packets=%q want [%q]", dst.packets, first)
+	}
+
+	n2, err2 := fwd.ForwardOnce()
+	if err2 != nil || n2 != len(second) {
+		t.Fatalf("second ForwardOnce: want (%d, nil), got (%d, %v)", len(second), n2, err2)
+	}
+	if len(dst.packets) != 2 || !bytes.Equal(dst.packets[0], first) || !bytes.Equal(dst.packets[1], second) {
+		t.Fatalf("packets=%q want [%q %q]", dst.packets, first, second)
+	}
+}
+
+type packetErrMorePartialWriter struct {
+	buf    bytes.Buffer
+	limit  int
+	called bool
+}
+
+func (w *packetErrMorePartialWriter) Write(p []byte) (int, error) {
+	if !w.called {
+		w.called = true
+		n := w.limit
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.buf.Write(p[:n])
+		}
+		return n, iox.ErrMore
+	}
+	return w.buf.Write(p)
+}
+
+func TestReaderWriteToPacketByteDstPartialWouldBlockResumesSuffix(t *testing.T) {
+	msg := []byte("packet")
+	r := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	dst := &capWouldBlockWriter{limit: 2}
+
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 2 {
+		t.Fatalf("first WriteTo: want (2, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+	dst.limit = len(msg)
+	n2, err2 := r.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)-2) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg)-2, n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToPacketByteDstPartialErrMoreResumesSuffix(t *testing.T) {
+	msg := []byte("packet")
+	r := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	dst := &packetErrMorePartialWriter{limit: 2}
+
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrMore) || n1 != 2 {
+		t.Fatalf("first WriteTo: want (2, ErrMore), got (%d, %v)", n1, err1)
+	}
+	n2, err2 := r.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)-2) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg)-2, n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToPacketSourceErrMoreSurvivesByteDstWouldBlock(t *testing.T) {
+	msg := []byte("packet")
+	src := &chunkErrReader{data: msg, err: iox.ErrMore}
+	r := fr.NewReader(src, fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	dst := &capWouldBlockWriter{limit: 2}
+
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 2 {
+		t.Fatalf("first WriteTo: want (2, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	dst.limit = len(msg)
+	n2, err2 := r.WriteTo(dst)
+	if !errors.Is(err2, iox.ErrMore) || n2 != int64(len(msg)-2) {
+		t.Fatalf("second WriteTo: want (%d, ErrMore), got (%d, %v)", len(msg)-2, n2, err2)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", dst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToPacketKnownPacketWriterZeroProgressRetainsWholePacket(t *testing.T) {
+	msg := []byte("packet")
+	src := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	dst := fr.NewWriter(rawDst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 0 {
+		t.Fatalf("first WriteTo: want (0, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	n2, err2 := src.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg), n2, err2)
+	}
+	if !bytes.Equal(rawDst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", rawDst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToPacketSourceEOFSurvivesPacketDstWouldBlock(t *testing.T) {
+	msg := []byte("packet")
+	src := &chunkErrReader{data: msg, err: io.EOF}
+	r := fr.NewReader(src, fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	dst := fr.NewWriter(rawDst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 0 {
+		t.Fatalf("first WriteTo: want (0, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	n2, err2 := r.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg), n2, err2)
+	}
+
+	n3, err3 := r.WriteTo(dst)
+	if err3 != nil || n3 != 0 {
+		t.Fatalf("third WriteTo: want (0, nil), got (%d, %v)", n3, err3)
+	}
+	if !bytes.Equal(rawDst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", rawDst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToPacketKnownStreamWriterPartialWouldBlockRetainsWholeFrame(t *testing.T) {
+	msg := []byte("packet")
+	src := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &capWouldBlockWriter{limit: 4}
+	dst := fr.NewWriter(rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 3 {
+		t.Fatalf("first WriteTo: want (3, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	rawDst.limit = len(msg) + 1
+	n2, err2 := src.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)-3) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg)-3, n2, err2)
+	}
+	requireSingleFramePayload(t, rawDst.buf.Bytes(), msg)
+}
+
+func TestReaderWriteToPacketSourceHardErrorSurvivesFrameDstWouldBlock(t *testing.T) {
+	msg := []byte("packet")
+	sourceErr := errors.New("source frontier")
+	src := &chunkErrReader{data: msg, err: sourceErr}
+	r := fr.NewReader(src, fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &capWouldBlockWriter{limit: 4}
+	dst := fr.NewWriter(rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 3 {
+		t.Fatalf("first WriteTo: want (3, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	rawDst.limit = len(msg) + 1
+	n2, err2 := r.WriteTo(dst)
+	if !errors.Is(err2, sourceErr) || n2 != int64(len(msg)-3) {
+		t.Fatalf("second WriteTo: want (%d, sourceErr), got (%d, %v)", len(msg)-3, n2, err2)
+	}
+	requireSingleFramePayload(t, rawDst.buf.Bytes(), msg)
+}
+
+func TestReaderWriteToPacketKnownStreamWriterResumeReblocksRetainsWholeFrame(t *testing.T) {
+	msg := []byte("packet")
+	src := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &capWouldBlockWriter{limit: 4}
+	dst := fr.NewWriter(rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 3 {
+		t.Fatalf("first WriteTo: want (3, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	rawDst.limit = 5
+	n2, err2 := src.WriteTo(dst)
+	if !errors.Is(err2, iox.ErrWouldBlock) || n2 != 1 {
+		t.Fatalf("second WriteTo: want (1, ErrWouldBlock), got (%d, %v)", n2, err2)
+	}
+
+	rawDst.limit = len(msg) + 1
+	n3, err3 := src.WriteTo(dst)
+	if err3 != nil || n3 != int64(len(msg)-4) {
+		t.Fatalf("third WriteTo: want (%d, nil), got (%d, %v)", len(msg)-4, n3, err3)
+	}
+	requireSingleFramePayload(t, rawDst.buf.Bytes(), msg)
+}
+
+func TestReaderWriteToPacketKnownStreamWriterResumeHardErrorClearsFrame(t *testing.T) {
+	msg := []byte("packet")
+	src := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	boom := errors.New("write failed")
+	rawDst := &resumeErrWriter{limit: 4, hardErr: boom}
+	dst := fr.NewWriter(rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 3 {
+		t.Fatalf("first WriteTo: want (3, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	n2, err2 := src.WriteTo(dst)
+	if !errors.Is(err2, boom) || n2 != 0 {
+		t.Fatalf("second WriteTo: want (0, boom), got (%d, %v)", n2, err2)
+	}
+}
+
+func TestReaderWriteToStreamKnownStreamWriterPartialWouldBlockRetainsWholeFrame(t *testing.T) {
+	msg := []byte("packet")
+	wire := append([]byte{byte(len(msg))}, msg...)
+	src := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &capWouldBlockWriter{limit: 4}
+	dst := fr.NewWriter(rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 3 {
+		t.Fatalf("first WriteTo: want (3, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	rawDst.limit = len(msg) + 1
+	n2, err2 := src.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)-3) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg)-3, n2, err2)
+	}
+	requireSingleFramePayload(t, rawDst.buf.Bytes(), msg)
+}
+
+func TestReaderWriteToStreamKnownPacketWriterResumeReblocksRetainsWholePacket(t *testing.T) {
+	msg := []byte("packet")
+	wire := append([]byte{byte(len(msg))}, msg...)
+	src := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	dst := fr.NewWriter(rawDst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 0 {
+		t.Fatalf("first WriteTo: want (0, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+	n2, err2 := src.WriteTo(dst)
+	if !errors.Is(err2, iox.ErrWouldBlock) || n2 != 0 {
+		t.Fatalf("second WriteTo: want (0, ErrWouldBlock), got (%d, %v)", n2, err2)
+	}
+	n3, err3 := src.WriteTo(dst)
+	if err3 != nil || n3 != int64(len(msg)) {
+		t.Fatalf("third WriteTo: want (%d, nil), got (%d, %v)", len(msg), n3, err3)
+	}
+	if !bytes.Equal(rawDst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", rawDst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToStreamKnownPacketWriterPartialWouldBlockIsShortWrite(t *testing.T) {
+	msg := []byte("packet")
+	wire := append([]byte{byte(len(msg))}, msg...)
+	src := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 2, err: iox.ErrWouldBlock},
+	}}
+	dst := fr.NewWriter(rawDst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n, err := src.WriteTo(dst)
+	if !errors.Is(err, io.ErrShortWrite) || n != 2 {
+		t.Fatalf("WriteTo: want (2, ErrShortWrite), got (%d, %v)", n, err)
+	}
+	if got, want := rawDst.buf.String(), "pa"; got != want {
+		t.Fatalf("dst=%q want %q", got, want)
+	}
+}
+
+func TestReaderWriteToPacketKnownStreamWriterErrMoreRetainsWholeFrame(t *testing.T) {
+	msg := []byte("packet")
+	src := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &capErrMoreWriter{limit: 4}
+	dst := fr.NewWriter(rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrMore) || n1 != 3 {
+		t.Fatalf("first WriteTo: want (3, ErrMore), got (%d, %v)", n1, err1)
+	}
+
+	rawDst.limit = len(msg) + 1
+	n2, err2 := src.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)-3) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg)-3, n2, err2)
+	}
+	requireSingleFramePayload(t, rawDst.buf.Bytes(), msg)
+}
+
+func TestReaderWriteToPacketSourceAfterRetainedBehindDestinationFullErrMore(t *testing.T) {
+	msg := []byte("packet")
+	sourceErr := errors.New("source frontier")
+	src := &chunkErrReader{data: msg, err: sourceErr}
+	r := fr.NewReader(src, fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: len(msg), err: iox.ErrMore},
+	}}
+	dst := fr.NewWriter(rawDst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := r.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrMore) || n1 != int64(len(msg)) {
+		t.Fatalf("first WriteTo: want (%d, ErrMore), got (%d, %v)", len(msg), n1, err1)
+	}
+
+	n2, err2 := r.WriteTo(dst)
+	if !errors.Is(err2, sourceErr) || n2 != 0 {
+		t.Fatalf("second WriteTo: want (0, sourceErr), got (%d, %v)", n2, err2)
+	}
+	if !bytes.Equal(rawDst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", rawDst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToStreamKnownPacketWriterZeroProgressRetainsWholePacket(t *testing.T) {
+	msg := []byte("packet")
+	wire := append([]byte{byte(len(msg))}, msg...)
+	src := fr.NewReader(bytes.NewReader(wire), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+	rawDst := &packetAtomicStepWriter{steps: []struct {
+		n   int
+		err error
+	}{
+		{n: 0, err: iox.ErrWouldBlock},
+	}}
+	dst := fr.NewWriter(rawDst, fr.WithProtocol(fr.SeqPacket), fr.WithNonblock())
+
+	n1, err1 := src.WriteTo(dst)
+	if !errors.Is(err1, iox.ErrWouldBlock) || n1 != 0 {
+		t.Fatalf("first WriteTo: want (0, ErrWouldBlock), got (%d, %v)", n1, err1)
+	}
+
+	n2, err2 := src.WriteTo(dst)
+	if err2 != nil || n2 != int64(len(msg)) {
+		t.Fatalf("second WriteTo: want (%d, nil), got (%d, %v)", len(msg), n2, err2)
+	}
+	if !bytes.Equal(rawDst.buf.Bytes(), msg) {
+		t.Fatalf("dst=%q want %q", rawDst.buf.Bytes(), msg)
+	}
+}
+
+func TestReaderWriteToStreamKnownStreamWriterZeroLengthMessageEmitsFrame(t *testing.T) {
+	src := fr.NewReader(bytes.NewReader([]byte{0}), fr.WithReadTCP(), fr.WithNonblock()).(*fr.Reader)
+	var rawDst bytes.Buffer
+	dst := fr.NewWriter(&rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n, err := src.WriteTo(dst)
+	if err != nil || n != 0 {
+		t.Fatalf("WriteTo: want (0, nil), got (%d, %v)", n, err)
+	}
+	requireSingleFramePayload(t, rawDst.Bytes(), nil)
+}
+
+func TestReaderWriteToPacketReadLimitUsesSentinelCapacity(t *testing.T) {
+	msg := []byte("12345")
+	r := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithReadLimit(4)).(*fr.Reader)
+	var dst bytes.Buffer
+
+	n, err := r.WriteTo(&dst)
+	if !errors.Is(err, fr.ErrTooLong) || n != 0 {
+		t.Fatalf("WriteTo: want (0, ErrTooLong), got (%d, %v)", n, err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("dst len=%d want 0", dst.Len())
+	}
+}
+
+func TestReaderWriteToPacketDefaultTransferCapRejectsOversize(t *testing.T) {
+	msg := bytes.Repeat([]byte{'x'}, 64*1024+1)
+	r := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP()).(*fr.Reader)
+	var dst bytes.Buffer
+
+	n, err := r.WriteTo(&dst)
+	if !errors.Is(err, fr.ErrTooLong) || n != 0 {
+		t.Fatalf("WriteTo: want (0, ErrTooLong), got (%d, %v)", n, err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("dst len=%d want 0", dst.Len())
+	}
+}
+
+func TestForwarderPacketReadLimitUsesSentinelCapacity(t *testing.T) {
+	msg := []byte("12345")
+	var dst bytes.Buffer
+	fwd := fr.NewForwarder(&dst, bytes.NewReader(msg), fr.WithProtocol(fr.SeqPacket), fr.WithReadLimit(4))
+
+	_, err := fwd.ForwardOnce()
+	if !errors.Is(err, fr.ErrTooLong) {
+		t.Fatalf("ForwardOnce: want ErrTooLong, got %v", err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("dst len=%d want 0", dst.Len())
+	}
+}
+
+func TestForwarderPacketDefaultTransferCapRejectsOversize(t *testing.T) {
+	msg := bytes.Repeat([]byte{'x'}, 64*1024+1)
+	var dst bytes.Buffer
+	fwd := fr.NewForwarder(&dst, bytes.NewReader(msg), fr.WithProtocol(fr.SeqPacket))
+
+	_, err := fwd.ForwardOnce()
+	if !errors.Is(err, fr.ErrTooLong) {
+		t.Fatalf("ForwardOnce: want ErrTooLong, got %v", err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("dst len=%d want 0", dst.Len())
 	}
 }
