@@ -2743,6 +2743,19 @@ func TestReaderWriteToPacketKnownStreamWriterPartialWouldBlockRetainsWholeFrame(
 	requireSingleFramePayload(t, rawDst.buf.Bytes(), msg)
 }
 
+func TestReaderWriteToPacketReadWriterDestinationEmitsFrame(t *testing.T) {
+	msg := []byte("packet")
+	src := fr.NewReader(bytes.NewReader(msg), fr.WithReadUDP(), fr.WithNonblock()).(*fr.Reader)
+	var rawDst bytes.Buffer
+	dst := fr.NewReadWriter(bytes.NewReader(nil), &rawDst, fr.WithWriteTCP(), fr.WithNonblock())
+
+	n, err := src.WriteTo(dst)
+	if err != nil || n != int64(len(msg)) {
+		t.Fatalf("WriteTo: want (%d, nil), got (%d, %v)", len(msg), n, err)
+	}
+	requireSingleFramePayload(t, rawDst.Bytes(), msg)
+}
+
 func TestReaderWriteToPacketSourceHardErrorSurvivesFrameDstWouldBlock(t *testing.T) {
 	msg := []byte("packet")
 	sourceErr := errors.New("source frontier")
