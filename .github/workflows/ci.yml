@@ -40,15 +40,15 @@ jobs:
 
       - name: Test
         if: matrix.os != 'ubuntu-latest'
-        run: go test ./... -count=1
+        run: go test -timeout 120s ./... -count=1
 
       - name: Test (with coverage)
         if: matrix.os == 'ubuntu-latest'
-        run: go test ./... -count=1 -covermode=atomic -coverprofile=coverage.out
+        run: go test -timeout 120s ./... -count=1 -covermode=atomic -coverprofile=coverage.out
 
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest'
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: coverage.out
           flags: framer
@@ -83,7 +83,7 @@ jobs:
         run: go env GOOS GOARCH
 
       - name: Test (native)
-        run: go test ./... -count=1
+        run: go test -timeout 120s ./... -count=1
 
   # Cross-compilation coverage for additional ports (compile only; no runners required).
   cross-compile:
@@ -94,7 +94,11 @@ jobs:
       matrix:
         target:
           - { goos: linux, goarch: 386 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: loong64 }
+          - { goos: linux, goarch: mips64 }
           - { goos: linux, goarch: ppc64le }
+          - { goos: linux, goarch: ppc64 }
           - { goos: linux, goarch: s390x }
           - { goos: linux, goarch: riscv64 }
           - { goos: linux, goarch: mips64le }

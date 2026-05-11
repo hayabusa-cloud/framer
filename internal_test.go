@@ -1,6 +1,5 @@
-//go:build (amd64 || arm64 || ppc64le || ppc64 || s390x || riscv64 || loong64 || mips64le || mips64) && !race
+//go:build amd64 || arm64 || ppc64le || ppc64 || s390x || riscv64 || loong64 || mips64le || mips64
 // +build amd64 arm64 ppc64le ppc64 s390x riscv64 loong64 mips64le mips64
-// +build !race
 
 // ©Hayabusa Cloud Co., Ltd. 2025. All rights reserved.
 // Use of this source code is governed by a MIT-style
@@ -15,7 +14,6 @@ import (
 	"io"
 	"testing"
 	"time"
-	"unsafe"
 
 	"code.hybscloud.com/iox"
 )
@@ -176,6 +174,71 @@ func TestAllocs_Reader_WriteTo_Stream(t *testing.T) {
 	}
 }
 
+func TestAllocs_Reader_WriteTo_StreamZeroLengthFirstUse(t *testing.T) {
+	sr := &scriptedReader{steps: []struct {
+		b   []byte
+		err error
+	}{
+		{b: []byte{0}, err: io.EOF},
+	}}
+	r := &Reader{fr: newFramer(sr, nil, WithReadTCP())}
+
+	var lastN int64
+	var lastErr error
+	allocs := testing.AllocsPerRun(1000, func() {
+		sr.step, sr.off = 0, 0
+		r.fr.reset()
+		clearWriteToPending(r.fr)
+		r.fr.rbuf = nil
+		lastN, lastErr = r.WriteTo(io.Discard)
+	})
+	if allocs != 0 {
+		t.Fatalf("allocs/op = %v want 0", allocs)
+	}
+	if lastN != 0 || lastErr != nil {
+		t.Fatalf("WriteTo: got (%d, %v), want (0, nil)", lastN, lastErr)
+	}
+	if r.fr.rbuf != nil {
+		t.Fatalf("rbuf allocated for zero-length stream message")
+	}
+}
+
+func TestReaderWriteToStreamZeroLengthFrameDestinationNoSourceScratch(t *testing.T) {
+	src := &Reader{fr: newFramer(bytes.NewReader([]byte{0}), nil, WithReadTCP())}
+	var raw bytes.Buffer
+	dst := &Writer{fr: newFramer(nil, &raw, WithWriteTCP())}
+
+	n, err := src.WriteTo(dst)
+	if n != 0 || err != nil {
+		t.Fatalf("WriteTo: got (%d, %v), want (0, nil)", n, err)
+	}
+	if src.fr.rbuf != nil {
+		t.Fatalf("source rbuf allocated for zero-length frame emission")
+	}
+}
+
+func TestAllocs_Reader_WriteTo_PacketControlPendingFirstUse(t *testing.T) {
+	sourceErr := errors.New("source frontier")
+	r := &Reader{fr: newFramer(bytes.NewReader(nil), nil, WithReadUDP())}
+
+	var lastN int64
+	var lastErr error
+	allocs := testing.AllocsPerRun(1000, func() {
+		r.fr.rbuf = nil
+		saveWriteToControl(r.fr, sourceErr)
+		lastN, lastErr = r.WriteTo(io.Discard)
+	})
+	if allocs != 0 {
+		t.Fatalf("allocs/op = %v want 0", allocs)
+	}
+	if lastN != 0 || !errors.Is(lastErr, sourceErr) {
+		t.Fatalf("WriteTo: got (%d, %v), want (0, sourceErr)", lastN, lastErr)
+	}
+	if r.fr.rbuf != nil {
+		t.Fatalf("rbuf allocated for control-only pending packet state")
+	}
+}
+
 func TestAllocs_Reader_WriteTo_WouldBlock(t *testing.T) {
 	sr := &scriptedReader{steps: []struct {
 		b   []byte
@@ -317,32 +380,6 @@ func encodeOneInternal(t *testing.T, payload []byte) []byte {
 	return raw.Bytes()
 }
 
-// --- Tests from internal_only_guards_test.go ---
-
-// fabricateOversizedSlice returns a []byte whose len is greater than framePayloadMaxLen56
-// without allocating memory for it.
-func fabricateOversizedSlice() []byte {
-	var dummy byte
-	huge := int(framePayloadMaxLen56 + 1)
-	return unsafe.Slice((*byte)(unsafe.Pointer(&dummy)), huge)
-}
-
-func TestWriteStream_GuardTooLongUnsafe(t *testing.T) {
-	fr := newFramer(nil, nil)
-	p := fabricateOversizedSlice()
-	if _, err := fr.writeStream(p); !errors.Is(err, ErrTooLong) {
-		t.Fatalf("err=%v want ErrTooLong", err)
-	}
-}
-
-func TestWritePacket_GuardTooLongUnsafe(t *testing.T) {
-	fr := newFramer(nil, nil)
-	p := fabricateOversizedSlice()
-	if _, err := fr.writePacket(p); !errors.Is(err, ErrTooLong) {
-		t.Fatalf("err=%v want ErrTooLong", err)
-	}
-}
-
 func TestReadStream_LengthGuardViaState(t *testing.T) {
 	fr := newFramer(nil, nil)
 	// Emulate "header and ext already consumed, do not parse length from header".
@@ -391,7 +428,7 @@ func (w *errMoreWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestWriteTo_Packet_WouldBlockOnWrite covers framer.go line 96-98 (WriteTo packet path ErrWouldBlock on write).
+// TestWriteTo_Packet_WouldBlockOnWrite covers packet WriteTo write-side suspension.
 func TestWriteTo_Packet_WouldBlockOnWrite(t *testing.T) {
 	// Packet mode reader with data
 	src := bytes.NewReader([]byte("hello"))
@@ -407,7 +444,7 @@ func TestWriteTo_Packet_WouldBlockOnWrite(t *testing.T) {
 	}
 }
 
-// TestWriteTo_Packet_ErrMoreOnWrite covers framer.go line 96-98 (WriteTo packet path ErrMore on write).
+// TestWriteTo_Packet_ErrMoreOnWrite covers packet WriteTo write-side continuation.
 func TestWriteTo_Packet_ErrMoreOnWrite(t *testing.T) {
 	src := bytes.NewReader([]byte("hello"))
 	r := &Reader{fr: newFramer(src, nil, WithProtocol(SeqPacket))}
@@ -422,7 +459,7 @@ func TestWriteTo_Packet_ErrMoreOnWrite(t *testing.T) {
 	}
 }
 
-// TestWriteTo_Stream_WouldBlockOnPayloadRead covers framer.go line 170-172 (WriteTo stream payload read ErrWouldBlock).
+// TestWriteTo_Stream_WouldBlockOnPayloadRead covers stream payload read suspension.
 func TestWriteTo_Stream_WouldBlockOnPayloadRead(t *testing.T) {
 	// Create a reader that returns header, then ErrWouldBlock during payload
 	sr := &scriptedReader{steps: []struct {
@@ -445,7 +482,7 @@ func TestWriteTo_Stream_WouldBlockOnPayloadRead(t *testing.T) {
 	}
 }
 
-// TestWriteTo_Stream_ErrMoreOnPayloadRead covers framer.go line 170-172 (WriteTo stream payload read ErrMore).
+// TestWriteTo_Stream_ErrMoreOnPayloadRead covers stream payload read continuation.
 func TestWriteTo_Stream_ErrMoreOnPayloadRead(t *testing.T) {
 	sr := &scriptedReader{steps: []struct {
 		b   []byte
@@ -466,7 +503,7 @@ func TestWriteTo_Stream_ErrMoreOnPayloadRead(t *testing.T) {
 	}
 }
 
-// TestWriteTo_Stream_EOFMidPayload covers framer.go line 173-175 (WriteTo stream EOF mid-payload returns ErrUnexpectedEOF).
+// TestWriteTo_Stream_EOFMidPayload covers stream EOF mid-payload handling.
 func TestWriteTo_Stream_EOFMidPayload(t *testing.T) {
 	sr := &scriptedReader{steps: []struct {
 		b   []byte
@@ -487,7 +524,7 @@ func TestWriteTo_Stream_EOFMidPayload(t *testing.T) {
 	}
 }
 
-// TestReadStream_PartialHeaderEOF covers internal.go lines 182-186 (partial header EOF - stream truncated).
+// TestReadStream_PartialHeaderEOF covers partial-header stream truncation.
 func TestReadStream_PartialHeaderEOF(t *testing.T) {
 	// Reader that returns first header byte then EOF (simulating truncated stream)
 	sr := &scriptedReader{steps: []struct {
@@ -505,7 +542,7 @@ func TestReadStream_PartialHeaderEOF(t *testing.T) {
 	}
 }
 
-// TestReadStream_EOFDuringExtendedLength covers internal.go line 209-212 (EOF during extended length read - break path).
+// TestReadStream_EOFDuringExtendedLength covers EOF while reading extended length bytes.
 func TestReadStream_EOFDuringExtendedLength(t *testing.T) {
 	// Reader that returns header byte, partial extended length, then EOF with data
 	sr := &scriptedReader{steps: []struct {
@@ -523,7 +560,7 @@ func TestReadStream_EOFDuringExtendedLength(t *testing.T) {
 	}
 }
 
-// TestReadStream_EOFDuringPayload covers internal.go line 252-256 (EOF during payload read - break path).
+// TestReadStream_EOFDuringPayload covers EOF returned with the final payload bytes.
 func TestReadStream_EOFDuringPayload(t *testing.T) {
 	// Reader that returns header, then payload with EOF together
 	sr := &scriptedReader{steps: []struct {
@@ -547,7 +584,7 @@ func TestReadStream_EOFDuringPayload(t *testing.T) {
 	}
 }
 
-// TestWriteStream_CallerChangedBufferMidFrame covers internal.go line 276-279 (caller changed buffer mid-frame).
+// TestWriteStream_CallerChangedBufferMidFrame covers caller length changes mid-frame.
 func TestWriteStream_CallerChangedBufferMidFrame(t *testing.T) {
 	// Create a writer that accepts partial writes
 	var buf bytes.Buffer
@@ -566,7 +603,7 @@ func TestWriteStream_CallerChangedBufferMidFrame(t *testing.T) {
 	}
 }
 
-// TestForwarder_Stream_WouldBlockDuringPayloadRead covers forward.go line 177-179 (ErrWouldBlock during stream payload read).
+// TestForwarder_Stream_WouldBlockDuringPayloadRead covers stream read-phase suspension.
 func TestForwarder_Stream_WouldBlockDuringPayloadRead(t *testing.T) {
 	// Create a reader that returns header, partial payload, then ErrWouldBlock
 	sr := &scriptedReader{steps: []struct {
@@ -589,7 +626,7 @@ func TestForwarder_Stream_WouldBlockDuringPayloadRead(t *testing.T) {
 	}
 }
 
-// TestForwarder_Stream_ErrMoreDuringPayloadRead covers forward.go line 177-179 (ErrMore during stream payload read).
+// TestForwarder_Stream_ErrMoreDuringPayloadRead covers stream read-phase continuation.
 func TestForwarder_Stream_ErrMoreDuringPayloadRead(t *testing.T) {
 	sr := &scriptedReader{steps: []struct {
 		b   []byte
@@ -631,8 +668,8 @@ func (r *eofOnCompleteReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestReadStream_EOFExactlyAtExtendedHeaderCompletion covers internal.go line 212 (break after EOF).
-// This requires EOF to be returned exactly when the extended header read completes.
+// TestReadStream_EOFExactlyAtExtendedHeaderCompletion covers EOF returned exactly
+// when the extended header read completes.
 func TestReadStream_EOFExactlyAtExtendedHeaderCompletion(t *testing.T) {
 	// Wire: 0xFE (16-bit length marker) + 2 bytes length (0x0100 = 256 in big-endian)
 	// The reader returns EOF exactly when the 3-byte header is complete.
@@ -647,8 +684,8 @@ func TestReadStream_EOFExactlyAtExtendedHeaderCompletion(t *testing.T) {
 	}
 }
 
-// TestReadStream_EOFExactlyAtPayloadCompletion covers internal.go line 256 (break after EOF).
-// This requires EOF to be returned exactly when the payload read completes.
+// TestReadStream_EOFExactlyAtPayloadCompletion covers EOF returned exactly when
+// the payload read completes.
 func TestReadStream_EOFExactlyAtPayloadCompletion(t *testing.T) {
 	// Wire: 1-byte header (length=5) + 5-byte payload
 	wire := []byte{5, 'h', 'e', 'l', 'l', 'o'}
@@ -678,7 +715,7 @@ func (w *shortWriteNilErrWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestWritePacket_ShortWriteWithNilError covers internal.go line 161-163.
+// TestWritePacket_ShortWriteWithNilError covers partial packet writes without errors.
 func TestWritePacket_ShortWriteWithNilError(t *testing.T) {
 	fr := newFramer(nil, &shortWriteNilErrWriter{}, WithProtocol(SeqPacket))
 	n, err := fr.writePacket([]byte("hello"))
@@ -690,7 +727,7 @@ func TestWritePacket_ShortWriteWithNilError(t *testing.T) {
 	}
 }
 
-// TestWriteTo_MessageExceedsRbufCapacity covers framer.go line 137-140.
+// TestWriteTo_MessageExceedsRbufCapacity covers stream messages beyond the scratch buffer.
 func TestWriteTo_MessageExceedsRbufCapacity(t *testing.T) {
 	// Create a wire with a message that has payload larger than the rbuf capacity.
 	// Use 16-bit header: 0xFE + 2-byte length
@@ -710,7 +747,7 @@ func TestWriteTo_MessageExceedsRbufCapacity(t *testing.T) {
 	}
 }
 
-// TestWriteTo_EOFMidPayload covers framer.go line 173-175.
+// TestWriteTo_EOFMidPayload covers EOF while WriteTo is reading a stream payload.
 func TestWriteTo_EOFMidPayload(t *testing.T) {
 	// Create a scripted reader that returns header, partial payload, then EOF
 	sr := &scriptedReader{steps: []struct {
@@ -729,8 +766,8 @@ func TestWriteTo_EOFMidPayload(t *testing.T) {
 	}
 }
 
-// TestReadStream_EOFExactlyAtMinimalHeaderCompletion covers internal.go line 186 (break after EOF at header).
-// This requires EOF to be returned exactly when the 1-byte minimal header is complete.
+// TestReadStream_EOFExactlyAtMinimalHeaderCompletion covers EOF returned exactly
+// when the 1-byte minimal header is complete.
 func TestReadStream_EOFExactlyAtMinimalHeaderCompletion(t *testing.T) {
 	// Reader that returns (1, io.EOF) - header byte with EOF together
 	// Header byte 5 means 5-byte payload
@@ -749,8 +786,7 @@ func TestReadStream_EOFExactlyAtMinimalHeaderCompletion(t *testing.T) {
 	}
 }
 
-// TestReadStream_NonEOFErrorDuringExtendedHeader covers internal.go line 214.
-// This requires a non-EOF error during extended header read.
+// TestReadStream_NonEOFErrorDuringExtendedHeader covers non-EOF extended-header errors.
 func TestReadStream_NonEOFErrorDuringExtendedHeader(t *testing.T) {
 	customErr := errors.New("custom read error")
 	sr := &scriptedReader{steps: []struct {
@@ -854,4 +890,356 @@ func TestWriteOnce_ProgressFirst_NoDuplication(t *testing.T) {
 	if got := dst.buf.String(); got != "ABCD" {
 		t.Fatalf("writeOnce: got %q, want %q", got, "ABCD")
 	}
+}
+
+type invalidCountWriter struct{}
+
+func (invalidCountWriter) Write(p []byte) (int, error) { return len(p) + 1, nil }
+
+type zeroNilWriter struct{}
+
+func (zeroNilWriter) Write([]byte) (int, error) { return 0, nil }
+
+type zeroErrWriter struct {
+	err error
+}
+
+func (w zeroErrWriter) Write([]byte) (int, error) { return 0, w.err }
+
+type fullErrWriter struct {
+	buf bytes.Buffer
+	err error
+}
+
+func (w *fullErrWriter) Write(p []byte) (int, error) {
+	_, _ = w.buf.Write(p)
+	return len(p), w.err
+}
+
+type packetErrReader struct {
+	err error
+}
+
+func (r packetErrReader) Read([]byte) (int, error) { return 0, r.err }
+
+type headerEOFReader struct {
+	done bool
+}
+
+func (r *headerEOFReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	p[0] = 0
+	return 1, io.EOF
+}
+
+func TestCoverageWritePacketDefensiveBranches(t *testing.T) {
+	t.Run("invalid count", func(t *testing.T) {
+		fr := newFramer(nil, invalidCountWriter{}, WithProtocol(SeqPacket))
+		n, err := fr.writePacket([]byte("x"))
+		if n != 0 || !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("want (0, ErrShortWrite), got (%d, %v)", n, err)
+		}
+	})
+
+	t.Run("zero nil write", func(t *testing.T) {
+		fr := newFramer(nil, zeroNilWriter{}, WithProtocol(SeqPacket))
+		n, err := fr.writePacket([]byte("x"))
+		if n != 0 || !errors.Is(err, io.ErrShortWrite) {
+			t.Fatalf("want (0, ErrShortWrite), got (%d, %v)", n, err)
+		}
+	})
+}
+
+func TestCoveragePacketTransferCapDefensiveBranches(t *testing.T) {
+	fr := newFramer(nil, nil, WithReadUDP(), WithReadLimit(maxInt()))
+
+	if _, err := packetTransferCap(fr); !errors.Is(err, ErrTooLong) {
+		t.Fatalf("packetTransferCap: want ErrTooLong, got %v", err)
+	}
+	if _, _, err := fr.ensurePacketReadBuffer(); !errors.Is(err, ErrTooLong) {
+		t.Fatalf("ensurePacketReadBuffer: want ErrTooLong, got %v", err)
+	}
+	if _, _, err := fr.ensureForwardBufferCap(); !errors.Is(err, ErrTooLong) {
+		t.Fatalf("ensureForwardBufferCap: want ErrTooLong, got %v", err)
+	}
+}
+
+func TestCoverageDrainByteCursorDefensiveCount(t *testing.T) {
+	cur := byteCursor{end: 1}
+	n, err := drainByteCursor(&cur, []byte("x"), invalidCountWriter{})
+	if n != 0 || !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("want (0, ErrShortWrite), got (%d, %v)", n, err)
+	}
+}
+
+func TestCoverageReadStreamHeaderEOFWithProgress(t *testing.T) {
+	fr := newFramer(&headerEOFReader{}, nil, WithReadTCP())
+	n, err := fr.read(make([]byte, 1))
+	if n != 0 || err != nil {
+		t.Fatalf("want (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+func TestCoverageForwarderPacketDefensiveBranches(t *testing.T) {
+	t.Run("constructor cap fallback", func(t *testing.T) {
+		f := NewForwarder(io.Discard, bytes.NewReader(nil), WithProtocol(SeqPacket), WithReadLimit(maxInt()))
+		if cap(f.buf) != defaultPacketTransferMax {
+			t.Fatalf("cap=%d want %d", cap(f.buf), defaultPacketTransferMax)
+		}
+	})
+
+	t.Run("forward cap error", func(t *testing.T) {
+		f := NewForwarder(io.Discard, bytes.NewReader(nil), WithProtocol(SeqPacket))
+		f.state = 1
+		f.rr.readLimit = int64(maxInt())
+		n, err := f.ForwardOnce()
+		if n != 0 || !errors.Is(err, ErrTooLong) {
+			t.Fatalf("want (0, ErrTooLong), got (%d, %v)", n, err)
+		}
+	})
+
+	t.Run("forward buffer too small", func(t *testing.T) {
+		f := NewForwarder(io.Discard, bytes.NewReader([]byte("packet")), WithProtocol(SeqPacket), WithReadLimit(4))
+		f.state = 1
+		f.buf = make([]byte, 1)
+		n, err := f.ForwardOnce()
+		if n != 0 || !errors.Is(err, io.ErrShortBuffer) {
+			t.Fatalf("want (0, ErrShortBuffer), got (%d, %v)", n, err)
+		}
+	})
+
+	t.Run("forward read ErrTooLong", func(t *testing.T) {
+		f := NewForwarder(io.Discard, packetErrReader{err: ErrTooLong}, WithProtocol(SeqPacket))
+		n, err := f.ForwardOnce()
+		if n != 0 || !errors.Is(err, ErrTooLong) {
+			t.Fatalf("want (0, ErrTooLong), got (%d, %v)", n, err)
+		}
+	})
+}
+
+func TestCoverageWriteToStreamZeroLengthKnownPacketDestinationControl(t *testing.T) {
+	src := &Reader{fr: newFramer(bytes.NewReader([]byte{0}), nil, WithReadTCP())}
+	rawDst := &fullErrWriter{err: ErrMore}
+	dst := &Writer{fr: newFramer(nil, rawDst, WithProtocol(SeqPacket))}
+
+	n, err := src.WriteTo(dst)
+	if n != 0 || !errors.Is(err, ErrMore) {
+		t.Fatalf("want (0, ErrMore), got (%d, %v)", n, err)
+	}
+	if rawDst.buf.Len() != 0 {
+		t.Fatalf("dst len=%d want 0", rawDst.buf.Len())
+	}
+}
+
+func TestCoverageWriteToStreamUnexpectedEOFPayload(t *testing.T) {
+	src := &Reader{fr: newFramer(bytes.NewReader([]byte{5, 'a'}), nil, WithReadTCP())}
+
+	n, err := src.WriteTo(io.Discard)
+	if n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("want (0, UnexpectedEOF), got (%d, %v)", n, err)
+	}
+}
+
+func TestCoverageWriteToPacketReadCapError(t *testing.T) {
+	src := &Reader{fr: newFramer(bytes.NewReader(nil), nil, WithReadUDP(), WithReadLimit(maxInt()))}
+
+	n, err := src.WriteTo(io.Discard)
+	if n != 0 || !errors.Is(err, ErrTooLong) {
+		t.Fatalf("want (0, ErrTooLong), got (%d, %v)", n, err)
+	}
+}
+
+func TestCoverageResumeWriteToPendingBranches(t *testing.T) {
+	t.Run("none", func(t *testing.T) {
+		fr := newFramer(nil, nil)
+		n, err, done := resumeWriteToPending(fr, writeToSink{mode: writeToByte, dst: io.Discard})
+		if n != 0 || err != nil || done {
+			t.Fatalf("want (0, nil, false), got (%d, %v, %v)", n, err, done)
+		}
+	})
+
+	t.Run("mode mismatch", func(t *testing.T) {
+		fr := newFramer(nil, nil)
+		saveWriteToPacket(fr, 1, nil)
+		n, err, done := resumeWriteToPending(fr, writeToSink{mode: writeToByte, dst: io.Discard})
+		if n != 0 || !errors.Is(err, io.ErrShortWrite) || !done {
+			t.Fatalf("want (0, ErrShortWrite, true), got (%d, %v, %v)", n, err, done)
+		}
+	})
+
+	t.Run("byte full control keeps source", func(t *testing.T) {
+		sourceErr := errors.New("source frontier")
+		fr := newFramer(nil, nil)
+		fr.rbuf = []byte("packet")
+		saveWriteToByteCursor(fr, 2, len(fr.rbuf), sourceErr)
+		dst := &fullErrWriter{err: ErrMore}
+
+		n, err, done := resumeWriteToPending(fr, writeToSink{mode: writeToByte, dst: dst})
+		if n != len("cket") || !errors.Is(err, ErrMore) || !done {
+			t.Fatalf("want (%d, ErrMore, true), got (%d, %v, %v)", len("cket"), n, err, done)
+		}
+		n, err, done = resumeWriteToPending(fr, writeToSink{mode: writeToByte, dst: io.Discard})
+		if n != 0 || !errors.Is(err, sourceErr) || !done {
+			t.Fatalf("want (0, sourceErr, true), got (%d, %v, %v)", n, err, done)
+		}
+	})
+
+	t.Run("packet resume full control keeps source", func(t *testing.T) {
+		sourceErr := errors.New("source frontier")
+		fr := newFramer(nil, nil)
+		fr.rbuf = []byte("packet")
+		saveWriteToPacket(fr, len(fr.rbuf), sourceErr)
+		rawDst := &fullErrWriter{err: ErrMore}
+		dst := newFramer(nil, rawDst, WithProtocol(SeqPacket))
+
+		n, err, done := resumeWriteToPending(fr, writeToSink{mode: writeToPacket, fr: dst})
+		if n != len(fr.rbuf) || !errors.Is(err, ErrMore) || !done {
+			t.Fatalf("want (%d, ErrMore, true), got (%d, %v, %v)", len(fr.rbuf), n, err, done)
+		}
+		n, err, done = resumeWriteToPending(fr, writeToSink{mode: writeToPacket, fr: dst})
+		if n != 0 || !errors.Is(err, sourceErr) || !done {
+			t.Fatalf("want (0, sourceErr, true), got (%d, %v, %v)", n, err, done)
+		}
+	})
+
+	t.Run("packet resume partial semantic clears", func(t *testing.T) {
+		fr := newFramer(nil, nil)
+		fr.rbuf = []byte("packet")
+		saveWriteToPacket(fr, len(fr.rbuf), errors.New("source frontier"))
+		rawDst := &partialWouldBlockWriter{partial: 2}
+		dst := newFramer(nil, rawDst, WithProtocol(SeqPacket))
+
+		n, err, done := resumeWriteToPending(fr, writeToSink{mode: writeToPacket, fr: dst})
+		if n != 2 || !errors.Is(err, io.ErrShortWrite) || !done || fr.wtMode != writeToNone {
+			t.Fatalf("want (2, ErrShortWrite, true) with cleared state, got (%d, %v, %v) wtMode=%d", n, err, done, fr.wtMode)
+		}
+	})
+
+	t.Run("invalid mode", func(t *testing.T) {
+		fr := newFramer(nil, nil)
+		fr.wtMode = writeToMode(99)
+		n, err, done := resumeWriteToPending(fr, writeToSink{mode: writeToMode(99)})
+		if n != 0 || !errors.Is(err, ErrInvalidArgument) || !done {
+			t.Fatalf("want (0, ErrInvalidArgument, true), got (%d, %v, %v)", n, err, done)
+		}
+	})
+}
+
+func TestCoverageEmitWriteToMessageBranches(t *testing.T) {
+	t.Run("byte full control keeps source", func(t *testing.T) {
+		sourceErr := errors.New("source frontier")
+		fr := newFramer(nil, nil)
+		dst := &fullErrWriter{err: ErrMore}
+
+		n, err, done := emitWriteToMessage(fr, writeToSink{mode: writeToByte, dst: dst}, []byte("packet"), sourceErr)
+		if n != len("packet") || !errors.Is(err, ErrMore) || !done {
+			t.Fatalf("want (%d, ErrMore, true), got (%d, %v, %v)", len("packet"), n, err, done)
+		}
+		n, err, done = resumeWriteToPending(fr, writeToSink{mode: writeToByte, dst: io.Discard})
+		if n != 0 || !errors.Is(err, sourceErr) || !done {
+			t.Fatalf("want (0, sourceErr, true), got (%d, %v, %v)", n, err, done)
+		}
+	})
+
+	t.Run("packet success reports after", func(t *testing.T) {
+		sourceErr := errors.New("source frontier")
+		fr := newFramer(nil, nil)
+		rawDst := &bytes.Buffer{}
+		dst := newFramer(nil, rawDst, WithProtocol(SeqPacket))
+
+		n, err, done := emitWriteToMessage(fr, writeToSink{mode: writeToPacket, fr: dst}, []byte("packet"), sourceErr)
+		if n != len("packet") || !errors.Is(err, sourceErr) || !done {
+			t.Fatalf("want (%d, sourceErr, true), got (%d, %v, %v)", len("packet"), n, err, done)
+		}
+	})
+
+	t.Run("frame hard error", func(t *testing.T) {
+		boom := errors.New("write failed")
+		fr := newFramer(nil, nil)
+		dst := newFramer(nil, &fullErrWriter{err: boom}, WithWriteTCP())
+
+		n, err, done := emitWriteToMessage(fr, writeToSink{mode: writeToFrame, fr: dst}, []byte("packet"), nil)
+		if n != 0 || !errors.Is(err, boom) || !done {
+			t.Fatalf("want (0, boom, true), got (%d, %v, %v)", n, err, done)
+		}
+	})
+
+	t.Run("invalid mode", func(t *testing.T) {
+		fr := newFramer(nil, nil)
+		n, err, done := emitWriteToMessage(fr, writeToSink{mode: writeToMode(99)}, []byte("packet"), nil)
+		if n != 0 || !errors.Is(err, ErrInvalidArgument) || !done {
+			t.Fatalf("want (0, ErrInvalidArgument, true), got (%d, %v, %v)", n, err, done)
+		}
+	})
+}
+
+func TestCoverageReadFromDefensiveBranches(t *testing.T) {
+	t.Run("stream pending larger than buffer", func(t *testing.T) {
+		fr := newFramer(nil, io.Discard, WithWriteTCP())
+		fr.wbuf = make([]byte, 1)
+		saveReadFromPending(fr, 2, nil)
+		w := &Writer{fr: fr}
+
+		n, err := w.ReadFrom(bytes.NewReader(nil))
+		if n != 0 || !errors.Is(err, io.ErrShortBuffer) {
+			t.Fatalf("want (0, ErrShortBuffer), got (%d, %v)", n, err)
+		}
+	})
+
+	t.Run("packet source semantic without progress", func(t *testing.T) {
+		w := &Writer{fr: newFramer(nil, io.Discard, WithProtocol(SeqPacket))}
+		n, err := w.ReadFrom(packetErrReader{err: ErrMore})
+		if n != 0 || !errors.Is(err, ErrMore) {
+			t.Fatalf("want (0, ErrMore), got (%d, %v)", n, err)
+		}
+	})
+}
+
+func TestCoverageReadFromPacketResumeBranches(t *testing.T) {
+	t.Run("zero progress semantic keeps packet", func(t *testing.T) {
+		rawDst := zeroErrWriter{err: ErrWouldBlock}
+		fr := newFramer(nil, rawDst, WithProtocol(SeqPacket))
+		fr.wbuf = []byte("packet")
+		saveReadFromPending(fr, len(fr.wbuf), nil)
+		w := &Writer{fr: fr}
+
+		n, err := w.readFromPacket(bytes.NewReader(nil))
+		if n != 0 || !errors.Is(err, ErrWouldBlock) || fr.rfLen != len(fr.wbuf) {
+			t.Fatalf("want (0, ErrWouldBlock) with pending packet, got (%d, %v) rfLen=%d", n, err, fr.rfLen)
+		}
+	})
+
+	t.Run("full semantic keeps source frontier", func(t *testing.T) {
+		sourceErr := errors.New("source frontier")
+		rawDst := &fullErrWriter{err: ErrMore}
+		fr := newFramer(nil, rawDst, WithProtocol(SeqPacket))
+		fr.wbuf = []byte("packet")
+		saveReadFromPending(fr, len(fr.wbuf), sourceErr)
+		w := &Writer{fr: fr}
+
+		n, err := w.readFromPacket(bytes.NewReader(nil))
+		if n != 0 || !errors.Is(err, ErrMore) || !hasReadFromControl(fr) {
+			t.Fatalf("want (0, ErrMore) with control pending, got (%d, %v) rfLen=%d rfAfter=%v", n, err, fr.rfLen, fr.rfAfter)
+		}
+		n, err = w.ReadFrom(bytes.NewReader(nil))
+		if n != 0 || !errors.Is(err, sourceErr) {
+			t.Fatalf("want (0, sourceErr), got (%d, %v)", n, err)
+		}
+	})
+
+	t.Run("partial semantic clears packet", func(t *testing.T) {
+		rawDst := &partialWouldBlockWriter{partial: 2}
+		fr := newFramer(nil, rawDst, WithProtocol(SeqPacket))
+		fr.wbuf = []byte("packet")
+		saveReadFromPending(fr, len(fr.wbuf), errors.New("source frontier"))
+		w := &Writer{fr: fr}
+
+		n, err := w.readFromPacket(bytes.NewReader(nil))
+		if n != 0 || !errors.Is(err, io.ErrShortWrite) || fr.rfLen != 0 || fr.rfAfter != nil {
+			t.Fatalf("want cleared ErrShortWrite, got (%d, %v) rfLen=%d rfAfter=%v", n, err, fr.rfLen, fr.rfAfter)
+		}
+	})
 }

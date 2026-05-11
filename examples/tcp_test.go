@@ -50,7 +50,8 @@ func TestExample_TCP_StreamFramingAndEcho(t *testing.T) {
 		srvCh <- serverResult{err: nil}
 	}()
 
-	// Client: write 3 messages, then read 3 echoes.
+	// Client: write each message and read its echo before sending the next one.
+	// net.Pipe is synchronous, so this schedule keeps both endpoints paired.
 	rw := framer.NewReadWriter(cClient, cClient, framer.WithReadTCP(), framer.WithWriteTCP())
 
 	msgs := [][]byte{
@@ -67,17 +68,14 @@ func TestExample_TCP_StreamFramingAndEcho(t *testing.T) {
 		if n != len(m) {
 			t.Fatalf("client write[%d]: n=%d want=%d", i, n, len(m))
 		}
-	}
-
-	for i, want := range msgs {
 		buf := make([]byte, 4096)
-		n, err := rw.Read(buf)
+		n, err = rw.Read(buf)
 		if err != nil {
 			t.Fatalf("client read[%d]: %v", i, err)
 		}
 		got := buf[:n]
-		if !bytes.Equal(got, want) {
-			t.Fatalf("echo mismatch[%d]: got=%q want=%q", i, got, want)
+		if !bytes.Equal(got, m) {
+			t.Fatalf("echo mismatch[%d]: got=%q want=%q", i, got, m)
 		}
 	}
 

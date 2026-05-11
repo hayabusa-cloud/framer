@@ -12,14 +12,14 @@ import (
 
 // Network option helpers and mapping.
 //
-// Single source of truth — transport → (Protocol, ByteOrder):
-//   - TCP         → BinaryStream, BigEndian (network byte order)
-//   - UDP         → Datagram,     BigEndian
-//   - WebSocket   → SeqPacket,    BigEndian  // boundaries preserved; pass-through
-//   - SCTP        → SeqPacket,    BigEndian  // boundaries preserved
-//   - Unix (stream)     → BinaryStream, BigEndian
-//   - UnixPacket  → Datagram,     BigEndian
-//   - Local (stream)    → BinaryStream, native byte order
+// Single source of truth: transport maps to (Protocol, ByteOrder):
+//   - TCP maps to BinaryStream, BigEndian.
+//   - UDP maps to Datagram, BigEndian.
+//   - WebSocket maps to SeqPacket, BigEndian.
+//   - SCTP maps to SeqPacket, BigEndian.
+//   - Unix stream maps to BinaryStream, BigEndian.
+//   - Unix packet maps to Datagram, BigEndian.
+//   - Local stream maps to BinaryStream, native byte order.
 //
 // Byte-order policy:
 //   - Network-named helpers (TCP/UDP/WebSocket/SCTP/Unix/UnixPacket) use BigEndian.
@@ -60,7 +60,7 @@ func defaultsFor(kind netKind) (Protocol, binary.ByteOrder) {
 	}
 }
 
-// WithReadTCP configures the reader side for TCP: BinaryStream with BigEndian length prefix.
+// WithReadTCP configures the reader side for TCP with BinaryStream and BigEndian length prefixes.
 func WithReadTCP() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netTCP)
@@ -69,7 +69,7 @@ func WithReadTCP() Option {
 	}
 }
 
-// WithWriteTCP configures the writer side for TCP: BinaryStream with BigEndian length prefix.
+// WithWriteTCP configures the writer side for TCP with BinaryStream and BigEndian length prefixes.
 func WithWriteTCP() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netTCP)
@@ -78,7 +78,7 @@ func WithWriteTCP() Option {
 	}
 }
 
-// WithReadUDP configures the reader side for UDP: Datagram (pass-through), BigEndian default.
+// WithReadUDP configures the reader side for UDP with Datagram pass-through and BigEndian byte order.
 func WithReadUDP() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netUDP)
@@ -87,7 +87,7 @@ func WithReadUDP() Option {
 	}
 }
 
-// WithWriteUDP configures the writer side for UDP: Datagram (pass-through), BigEndian default.
+// WithWriteUDP configures the writer side for UDP with Datagram pass-through and BigEndian byte order.
 func WithWriteUDP() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netUDP)
@@ -96,7 +96,7 @@ func WithWriteUDP() Option {
 	}
 }
 
-// WithReadWebSocket configures the reader side for WebSocket: SeqPacket (boundaries preserved), BigEndian.
+// WithReadWebSocket configures the reader side for WebSocket with SeqPacket pass-through and BigEndian byte order.
 func WithReadWebSocket() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netWebSocket)
@@ -105,7 +105,7 @@ func WithReadWebSocket() Option {
 	}
 }
 
-// WithWriteWebSocket configures the writer side for WebSocket: SeqPacket (boundaries preserved), BigEndian.
+// WithWriteWebSocket configures the writer side for WebSocket with SeqPacket pass-through and BigEndian byte order.
 func WithWriteWebSocket() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netWebSocket)
@@ -114,7 +114,7 @@ func WithWriteWebSocket() Option {
 	}
 }
 
-// WithReadSCTP configures the reader side for SCTP: SeqPacket (boundaries preserved), BigEndian.
+// WithReadSCTP configures the reader side for SCTP with SeqPacket pass-through and BigEndian byte order.
 func WithReadSCTP() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netSCTP)
@@ -123,7 +123,7 @@ func WithReadSCTP() Option {
 	}
 }
 
-// WithWriteSCTP configures the writer side for SCTP: SeqPacket (boundaries preserved), BigEndian.
+// WithWriteSCTP configures the writer side for SCTP with SeqPacket pass-through and BigEndian byte order.
 func WithWriteSCTP() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netSCTP)
@@ -132,7 +132,7 @@ func WithWriteSCTP() Option {
 	}
 }
 
-// WithReadUnix configures the reader side for Unix stream sockets: BinaryStream, BigEndian.
+// WithReadUnix configures the reader side for Unix stream sockets with BinaryStream and BigEndian byte order.
 func WithReadUnix() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netUnixStream)
@@ -141,7 +141,7 @@ func WithReadUnix() Option {
 	}
 }
 
-// WithWriteUnix configures the writer side for Unix stream sockets: BinaryStream, BigEndian.
+// WithWriteUnix configures the writer side for Unix stream sockets with BinaryStream and BigEndian byte order.
 func WithWriteUnix() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netUnixStream)
@@ -150,7 +150,7 @@ func WithWriteUnix() Option {
 	}
 }
 
-// WithReadUnixPacket configures the reader side for Unix datagram sockets: Datagram (pass-through), BigEndian.
+// WithReadUnixPacket configures the reader side for Unix packet sockets with Datagram pass-through and BigEndian byte order.
 func WithReadUnixPacket() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netUnixPacket)
@@ -159,7 +159,7 @@ func WithReadUnixPacket() Option {
 	}
 }
 
-// WithWriteUnixPacket configures the writer side for Unix datagram sockets: Datagram (pass-through), BigEndian.
+// WithWriteUnixPacket configures the writer side for Unix packet sockets with Datagram pass-through and BigEndian byte order.
 func WithWriteUnixPacket() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netUnixPacket)
@@ -168,7 +168,7 @@ func WithWriteUnixPacket() Option {
 	}
 }
 
-// WithReadLocal configures the reader side for local (stream) transports: BinaryStream, native byte order.
+// WithReadLocal configures the reader side for local stream transports with BinaryStream and native byte order.
 func WithReadLocal() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netLocalStream)
@@ -177,7 +177,7 @@ func WithReadLocal() Option {
 	}
 }
 
-// WithWriteLocal configures the writer side for local (stream) transports: BinaryStream, native byte order.
+// WithWriteLocal configures the writer side for local stream transports with BinaryStream and native byte order.
 func WithWriteLocal() Option {
 	return func(o *Options) {
 		p, bo := defaultsFor(netLocalStream)

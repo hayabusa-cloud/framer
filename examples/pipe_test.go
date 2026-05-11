@@ -5,6 +5,7 @@ package examples_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -29,15 +30,22 @@ func TestExample_NetPipe_StreamFraming(t *testing.T) {
 		bytes.Repeat([]byte("A"), 300), // > 253 => extended length encoding
 	}
 
-	for i, m := range msgs {
-		n, err := w.Write(m)
-		if err != nil {
-			t.Fatalf("write[%d]: %v", i, err)
+	writeDone := make(chan error, 1)
+	go func() {
+		defer c1.Close()
+		for i, m := range msgs {
+			n, err := w.Write(m)
+			if err != nil {
+				writeDone <- fmt.Errorf("write[%d]: %w", i, err)
+				return
+			}
+			if n != len(m) {
+				writeDone <- fmt.Errorf("write[%d]: n=%d want=%d", i, n, len(m))
+				return
+			}
 		}
-		if n != len(m) {
-			t.Fatalf("write[%d]: n=%d want=%d", i, n, len(m))
-		}
-	}
+		writeDone <- nil
+	}()
 
 	for i, want := range msgs {
 		buf := make([]byte, len(want))
@@ -51,6 +59,10 @@ func TestExample_NetPipe_StreamFraming(t *testing.T) {
 		if !bytes.Equal(buf[:n], want) {
 			t.Fatalf("read[%d]: payload mismatch", i)
 		}
+	}
+
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
 	}
 
 	// Sanity: no extra bytes should remain.
