@@ -13,7 +13,7 @@ Alcance: conservación de límites de mensaje en transportes de flujo.
 
 ## Descripción general
 
-Muchos transportes son flujos de bytes (TCP, Unix stream, pipes). Un solo `Read` puede devolver una fracción de un mensaje de aplicación, o varios mensajes concatenados. `framer` restaura los límites: en modo stream, un `Read` devuelve exactamente una carga útil de mensaje y un `Write` emite exactamente un mensaje enmarcado.
+Los transportes de bytes como TCP, Unix stream y pipes no preservan los límites de los mensajes de aplicación. Framer añade prefijos de longitud para que cada operación de lectura/escritura completada corresponda a un mensaje. Una operación no bloqueante puede requerir varias llamadas con estado retenido.
 
 - Preservación de límites de mensaje en flujos de bytes (TCP, Unix stream, pipes).
 - Pass-through en transportes que ya preservan límites (UDP, Unix datagram, WebSocket, SCTP).
@@ -25,7 +25,7 @@ Muchos transportes son flujos de bytes (TCP, Unix stream, pipes). Un solo `Read`
 - `SeqPacket` (p. ej., SCTP, WebSocket): paso directo; el transporte ya preserva límites.
 - `Datagram` (p. ej., UDP, Unix datagram): paso directo; el transporte ya preserva límites.
 - Para `Reader.Read`, los modos de paquete son de paso directo: `WithReadLimit` se verifica después de una recepción, por lo que un paquete sobredimensionado puede devolver `n > limit` con `ErrTooLong`; `n` son los bytes copiados desde ese paquete.
-- Las rutas de salida de paquete reintentan paquetes completos solo después de `ErrWouldBlock` / `ErrMore` con progreso cero; un paquete aceptado por completo y devuelto con `ErrWouldBlock` o `ErrMore` no se repite, y las escrituras parciales de paquete se reportan como `io.ErrShortWrite`.
+- Las rutas de salida de paquete reintentan paquetes completos solo después de `ErrWouldBlock` / `ErrMore` con progreso cero; un paquete no vacío aceptado por completo y devuelto con `ErrWouldBlock` o `ErrMore` no se repite, y las escrituras parciales de paquete se reportan como `io.ErrShortWrite`.
 
 Selecciona al construir vía `WithProtocol(...)` (hay variantes de lectura/escritura) o usa los ayudantes de transporte (ver Opciones).
 
@@ -76,26 +76,55 @@ fmt.Printf("got: %q\n", buf[:n])
 
 ## Uso no bloqueante
 
-`framer` opera en modo no bloqueante por defecto. En un bucle orientado a eventos:
+En BinaryStream, conserve `r`, el `buf` completo y el contador acumulado `received` en el estado de la conexión. Cada servicio del bucle de eventos realiza una llamada:
 
 ```go
-for {
-	n, err := r.Read(buf)
-	if n > 0 {
-		process(buf[:n])
-	}
-	if err != nil {
-		if err == framer.ErrWouldBlock {
-			// Sin datos ahora; esperar disponibilidad de lectura (epoll, io_uring, etc.)
-			continue
-		}
-		if err == io.EOF {
-			break
-		}
-		log.Fatal(err)
-	}
+n, err := r.Read(buf)
+received += n
+if err != nil {
+	return err
 }
+process(buf[:received])
+received = 0
 ```
+
+Ante `ErrWouldBlock` o `ErrMore`, conserve ese estado y devuelva el control al planificador. Reanude con el mismo buffer según la disponibilidad de entrada y el presupuesto de trabajo. Procese el mensaje completo solo con error nil, incluidos los mensajes vacíos. `n` cuenta los bytes de carga útil copiados en esta llamada; una llamada que completa progreso anterior puede devolver cero.
+
+## Códec BinaryStream con entrada prestada
+
+Use `Decoder` para bytes ya recibidos en buffers del llamador. Su valor cero
+selecciona big-endian y el máximo del formato; `NewDecoder(order, limit)`
+acepta nil u órdenes estándar, con límite cero para el máximo del formato.
+
+`Decode(src)` devuelve los **bytes del formato consumidos** y un `Chunk`:
+`Data` es una vista de la carga útil con capacidad igual a su longitud,
+`Length` es la longitud total y `Begin`/`End` marcan los límites del mensaje.
+Cada llamada se detiene al terminar el mensaje actual. Procese el resultado y
+avance por los bytes consumidos; no los repita. Mantenga válido el almacenamiento
+mientras use `Data`; el decodificador no retiene entrada ni carga útil.
+
+`nil` termina un mensaje. `ErrMore` indica progreso en una trama incompleta,
+posiblemente solo de cabecera; no garantiza más entrada. Una entrada vacía
+devuelve `ErrWouldBlock`: espere nuevos datos sin sondeo continuo.
+Llame a `Finish()` al finalizar la entrada para detectar truncamientos.
+Los fallos persisten hasta `Reset()`, que conserva la configuración y exige
+un flujo nuevo o un límite de trama establecido.
+
+`EncodeHeader` escribe solo la cabecera mínima en el almacenamiento suministrado;
+los errores no lo modifican. Ambas operaciones evitan copias de carga útil,
+asignaciones de heap y esperas. El llamador controla el presupuesto de trabajo
+y la vida útil de los buffers.
+
+```go
+var header [framer.MaxHeaderSize]byte
+n, err := framer.EncodeHeader(header[:], uint64(len(payload)), nil)
+if err != nil {
+    return err
+}
+// Envíe header[:n] y luego payload; conserve ambos hasta que E/S los libere.
+```
+
+Consulte el [ejemplo de decodificación incremental](codec_example_test.go).
 
 ## Opciones
 
@@ -120,8 +149,9 @@ Más detalles: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 ### Nota sobre modos de paquete (`SeqPacket` / `Datagram`)
 
 - El modo de paquete preserva límites del transporte y no divide paquetes.
+- `(0, nil)` de una fuente de paquetes completa un mensaje vacío; cero bytes con un error de fuente no forman un mensaje. La salida de un paquete vacío solo se acepta con `nil`; `(0, ErrWouldBlock)` / `(0, ErrMore)` queda pendiente.
 - `Reader.Read` aplica `WithReadLimit` después de una lectura de paquete; las rutas auxiliares de transferencia usan un byte centinela para rechazar paquetes sobredimensionados antes de reenviar bytes.
-- Los destinos que preservan paquetes reintentan el paquete completo solo después de `ErrWouldBlock` / `ErrMore` con progreso cero; un paquete aceptado por completo y devuelto con `ErrWouldBlock` o `ErrMore` no se repite, y las escrituras parciales de paquete son fallos de límite y devuelven `io.ErrShortWrite`.
+- Los destinos que preservan paquetes reintentan el paquete completo solo después de `ErrWouldBlock` / `ErrMore` con progreso cero; un paquete no vacío aceptado por completo y devuelto con `ErrWouldBlock` o `ErrMore` no se repite, y las escrituras parciales de paquete son fallos de límite y devuelven `io.ErrShortWrite`.
 - `Reader.WriteTo` hacia un `io.Writer` arbitrario es una transferencia de bytes con reanudación por sufijo. Cuando el destino es un `framer.Writer`, usa el álgebra del destino: los escritores de paquete reintentan el paquete completo tras progreso cero, y los escritores de flujo reintentan el mismo marco en curso.
 - Si una fuente de paquete devuelve `(n > 0, err)`, `Reader.WriteTo` emite el paquete admitido antes de reportar `err`; una suspensión de escritura conserva esa señal de fuente pendiente durante el reintento.
 - Los conteos de progreso dependen de la operación: `Reader.Read` reporta bytes copiados en `p`, `Reader.WriteTo` reporta bytes escritos en `dst`, `Writer.ReadFrom` reporta bytes leídos desde `src` y admitidos en el estado del escritor, y `Forwarder.ForwardOnce` reporta el progreso de su fase actual.
@@ -129,9 +159,9 @@ Más detalles: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 ### Disciplina de reintento
 
 - `ErrWouldBlock` es suspensión de disponibilidad, no fallo; las rutas agregadas pueden devolver un conteo positivo cuando pasos anteriores del bucle avanzaron antes de la suspensión.
-- `ErrMore` significa que la misma operación todavía tiene progreso por entregar; no es `io.EOF` ni suspensión de disponibilidad. Procesa cualquier progreso devuelto y vuelve a llamar la misma operación.
+- `ErrMore` mantiene viva la operación; no es EOF ni garantiza entrada disponible. Procese el progreso y reanude según el contrato de reintento y el presupuesto del llamador.
 - Reintenta `Reader.Read` tras progreso parcial de flujo en el mismo `Reader` y con el mismo búfer.
-- Reintenta `Writer.Write` tras una suspensión BinaryStream en el mismo `Writer` y con la misma longitud de mensaje; los bytes de cabecera BinaryStream no se incluyen en `n`. En modos de paquete, `n == len(p)` con `ErrWouldBlock` o `ErrMore` significa que el paquete fue aceptado, así que no repitas `p`.
+- Reintenta `Writer.Write` tras una suspensión BinaryStream en el mismo `Writer` y con la misma longitud de mensaje; los bytes de cabecera BinaryStream no se incluyen en `n`. La cabecera de un marco vacío puede haberse escrito antes de la suspensión; el reintento completa el mismo marco sin repetir la cabecera. En modos de paquete, `n == len(p) && n > 0` con `ErrWouldBlock` o `ErrMore` significa que el paquete fue aceptado, así que no repitas `p`.
 - Reintenta `Reader.WriteTo` en el mismo `Reader` y el mismo destino, `Writer.ReadFrom` en el mismo `Writer`, y `Forwarder.ForwardOnce` en el mismo `Forwarder`.
 
 ### Contrato de rendimiento
@@ -143,39 +173,41 @@ Más detalles: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 
 | Error | Significado | Acción del llamador |
 |-------|-------------|---------------------|
-| `nil` | Operación completada con éxito | Continúa; `n` refleja el progreso total |
+| `nil` | Operación completada con éxito | Continuar; n indica el progreso de esta llamada |
 | `io.EOF` | Fin de stream (no hay más mensajes) | Deja de leer; terminación normal |
 | `io.ErrUnexpectedEOF` | El flujo terminó a mitad de mensaje (cabecera o carga útil incompleta) | Trátalo como fatal; posible corrupción o desconexión |
 | `io.ErrShortBuffer` | Búfer destino demasiado pequeño para la carga útil | Reintenta con un búfer más grande |
 | `io.ErrShortWrite` | El destino aceptó menos bytes que los provistos | Reintenta o trátalo como fatal según el contexto |
-| `io.ErrNoProgress` | El Reader subyacente no avanzó (`n==0, err==nil`) con búfer no vacío | Trátalo como fatal; indica un `io.Reader` roto |
+| `io.ErrNoProgress` | El Reader de flujo o la fuente genérica de ReadFrom devolvió `(0, nil)` con búfer no vacío | Detenerse o delegar el reintento al llamador; framer no sondea sin progreso |
 | `framer.ErrWouldBlock` | No es posible avanzar ahora sin esperar | Reintenta más tarde (tras poll/event); `n` puede ser >0 |
-| `framer.ErrMore` | La misma operación todavía tiene progreso por entregar, distinto de EOF y de suspensión de disponibilidad | Procesa el progreso devuelto y vuelve a llamar la misma operación |
+| `framer.ErrMore` | La misma operación todavía tiene progreso por entregar, distinto de EOF y de suspensión de disponibilidad | Procesar el progreso; reanudar según el contrato de entrada y planificación |
 | `framer.ErrTooLong` | El mensaje excede un límite configurado, un tope de transferencia o el límite del formato en línea | Rechaza; posiblemente fatal |
 | `framer.ErrInvalidArgument` | Reader/Writer nil o configuración inválida | Corrige la configuración |
 
 ### Tablas de resultados
 
+Los contadores de Reader/Writer siguientes corresponden a cada llamada, no a la longitud acumulada del mensaje. Súmelos entre reintentos; nil puede completar progreso anterior con `n == 0`.
+
 **`Reader.Read(p []byte) (n int, err error)`** (modo BinaryStream)
 
 | Condición | n | err |
 |----------|---|-----|
-| Mensaje completo entregado | longitud de carga útil | `nil` |
+| Mensaje completo entregado | bytes de carga útil copiados en esta llamada; puede ser 0 | `nil` |
 | `len(p) < longitud de carga útil` | 0 | `io.ErrShortBuffer` |
 | La carga útil excede ReadLimit | 0 | `ErrTooLong` |
-| El subyacente devuelve `ErrWouldBlock` | bytes leídos hasta ahora | `ErrWouldBlock` |
-| El subyacente devuelve more | bytes leídos hasta ahora | `ErrMore` |
+| El subyacente devuelve `ErrWouldBlock` | bytes de carga útil copiados en esta llamada; puede ser 0 | `ErrWouldBlock` |
+| El subyacente devuelve more | bytes de carga útil copiados en esta llamada; puede ser 0 | `ErrMore` |
 | EOF en el límite de mensaje | 0 | `io.EOF` |
-| EOF a mitad de cabecera o carga útil | bytes leídos | `io.ErrUnexpectedEOF` |
+| EOF a mitad de cabecera o carga útil | bytes de carga útil copiados en esta llamada; puede ser 0 | `io.ErrUnexpectedEOF` |
 
 **`Writer.Write(p []byte) (n int, err error)`** (modo BinaryStream)
 
 | Condición | n | err |
 |----------|---|-----|
-| Mensaje enmarcado completo emitido | `len(p)` | `nil` |
+| Mensaje enmarcado completo emitido | bytes de carga útil aceptados en esta llamada; puede ser 0 | `nil` |
 | La carga útil excede el máximo (2^56-1) | 0 | `ErrTooLong` |
-| El subyacente devuelve `ErrWouldBlock` | bytes de carga útil escritos | `ErrWouldBlock` |
-| El subyacente devuelve more | bytes de carga útil escritos | `ErrMore` |
+| El subyacente devuelve `ErrWouldBlock` | bytes de carga útil aceptados en esta llamada; puede ser 0 | `ErrWouldBlock` |
+| El subyacente devuelve more | bytes de carga útil aceptados en esta llamada; puede ser 0 | `ErrMore` |
 
 **`Reader.WriteTo(dst io.Writer) (n int64, err error)`**
 
@@ -194,6 +226,7 @@ Más detalles: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 | Condición | n | err |
 |----------|---|-----|
 | Chunks codificados hasta src EOF | bytes totales leídos desde `src` | `nil` |
+| `src` devuelve `(0, nil)` | bytes admitidos antes en esta llamada | `io.ErrNoProgress` |
 | `src` devuelve `ErrWouldBlock` | bytes leídos desde `src` antes de la señal | `ErrWouldBlock` |
 | `src` devuelve more | bytes leídos desde `src` antes de la señal | `ErrMore` |
 | Writer subyacente devuelve `ErrWouldBlock` | bytes leídos desde `src` y admitidos antes de la suspensión; 0 en reanudación solo de escritura | `ErrWouldBlock` |
@@ -203,8 +236,8 @@ Más detalles: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 
 | Condición | n | err |
 |----------|---|-----|
-| Un mensaje reenviado completamente | bytes de carga útil (fase de escritura) | `nil` |
-| Fuente de paquete devuelve `(n > 0, io.EOF)` | bytes de carga útil (fase de escritura) | `nil` (la próxima llamada devuelve `io.EOF`) |
+| Un mensaje reenviado completamente | bytes de carga útil aceptados en esta llamada; puede ser 0 | `nil` |
+| Fuente de paquete devuelve `(n > 0, io.EOF)` | bytes de carga útil aceptados en esta llamada; puede ser 0 | `nil` (la próxima llamada devuelve `io.EOF`) |
 | No hay más mensajes | 0 | `io.EOF` |
 | La fuente devuelve `ErrWouldBlock` | bytes leídos si no se emitió ningún paquete; un `n > 0` de fuente de paquete se emite primero y devuelve bytes de carga útil (fase de escritura) | `ErrWouldBlock` |
 | La fuente devuelve more | bytes leídos si no se emitió ningún paquete; un `n > 0` de fuente de paquete se emite primero y devuelve bytes de carga útil (fase de escritura) | `ErrMore` |
@@ -218,8 +251,8 @@ Más detalles: GoDoc https://pkg.go.dev/code.hybscloud.com/framer
 
 | Operación | Comportamiento de límites | Caso de uso |
 |----------|----------------------------|------------|
-| `Reader.Read` | **Preserva límites**: 1 llamada = 1 mensaje | Procesamiento por mensaje |
-| `Writer.Write` | **Preserva límites**: 1 llamada = 1 mensaje | Envío por mensaje |
+| `Reader.Read` | **Preserva mensajes**: una operación completada corresponde a un mensaje; puede necesitar reintentos | Procesamiento por mensaje |
+| `Writer.Write` | **Preserva mensajes**: una operación completada corresponde a un mensaje; puede necesitar reintentos | Envío por mensaje |
 | `Reader.WriteTo` | **Transferencia de bytes** hacia escritores arbitrarios; destinos `framer` conocidos preservan la ley de reintento de paquete/marco | Transferencia eficiente con reanudación por sufijo |
 | `Writer.ReadFrom` | **Fragmentación**: cada fragmento de `src` se vuelve un mensaje; la salida de paquete reintenta el paquete completo solo tras progreso cero | Codificación eficiente; NO preserva límites aguas arriba |
 | `Forwarder.ForwardOnce` | **Relay con límites**: decodifica uno, re-encodifica uno | Proxy con preservación de límites |
@@ -233,7 +266,7 @@ Por defecto, framer es **no bloqueante** (`WithNonblock()`): devuelve `ErrWouldB
 - `RetryDelay` negativo (por defecto): devuelve `ErrWouldBlock` de progreso cero inmediatamente
 - Si una lectura o escritura ya transfirió bytes, framer devuelve el conteo positivo con `ErrWouldBlock`; procesa el progreso y reintenta la misma operación según se documenta arriba.
 
-Ningún método oculta bloqueo a menos que se configure explícitamente.
+`WithNonblock()` desactiva los reintentos would-block de framer. No convierte un transporte bloqueante en uno no bloqueante.
 
 `framer` utiliza las señales de control de flujo de `code.hybscloud.com/iox`. `ErrWouldBlock` y `ErrMore` son alias de `iox`, lo que permite la integración directa con otros componentes compatibles con `iox` (`iofd`, `takt`).
 
@@ -246,9 +279,9 @@ Ningún método oculta bloqueo a menos que se configure explícitamente.
   - Packet (`SeqPacket`/`Datagram`): transferencia de bytes de paso directo; las lecturas con capacidad centinela rechazan paquetes sobredimensionados antes de reenviar, y `n` cuenta bytes escritos en `dst`.
   - Los errores de escritura `framer.ErrWouldBlock` y `framer.ErrMore` se propagan sin cambios, con el conteo reflejando bytes escritos; los errores de fuente de paquete devueltos con bytes se reportan después de emitir el paquete admitido.
 
-- `(*Writer).ReadFrom(io.Reader)`: de fragmentos a mensajes; cada fragmento leído de `src` se codifica como un mensaje y se escribe vía `w.Write`.
+- `(*Writer).ReadFrom(io.Reader)`: de fragmentos a mensajes; cada fragmento no vacío leído de `src` se codifica como un mensaje y se escribe vía `w.Write`.
   - Es eficiente pero no preserva límites de mensaje de `src`.
-  - En protocolos que preservan límites, se comporta como paso directo.
+  - La salida de paquetes emite cada fragmento como un paquete; no determina el protocolo de entrada. Una fuente que devuelve `(0, nil)` produce inmediatamente `io.ErrNoProgress`, sin emitir un mensaje vacío.
   - `framer.ErrWouldBlock` y `framer.ErrMore` se propagan sin cambios; `n` cuenta bytes leídos desde `src` y admitidos en el estado del escritor.
 
 Recomendación: en bucles no bloqueantes, prefiere `iox.CopyPolicy` con política de reintentos (p. ej., `PolicyRetry`) para manejar explícitamente `ErrWouldBlock` / `ErrMore`.
@@ -269,19 +302,13 @@ Ejemplo de relevo por mensaje:
 
 ```go
 fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+```
 
-for {
-	_, err := fwd.ForwardOnce()
-	if err != nil {
-		if err == framer.ErrWouldBlock {
-			continue // esperar src legible o dst escribible
-		}
-		if err == io.EOF {
-			break
-		}
-		log.Fatal(err)
-	}
-}
+Construya el reenviador una sola vez. Cada servicio posterior usa la misma instancia y devuelve la señal de control al llamador:
+
+```go
+_, err := fwd.ForwardOnce()
+return err
 ```
 
 ## Licencia
