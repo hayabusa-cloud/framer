@@ -44,6 +44,8 @@ func (p Protocol) preserveBoundary() bool {
 // Callers normally pass Option helpers rather than constructing Options
 // directly; the zero Options value is not a complete configuration because byte
 // order fields may be nil.
+// Byte orders must use a consistent big- or little-endian layout across integer
+// widths. Constructors determine that layout once and retain the implementation.
 type Options struct {
 	// ReadByteOrder controls BinaryStream length-prefix decoding.
 	ReadByteOrder binary.ByteOrder

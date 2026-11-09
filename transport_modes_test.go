@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	fr "code.hybscloud.com/framer"
 	"code.hybscloud.com/iox"
@@ -573,6 +574,40 @@ func TestDatagramRoundTrip(t *testing.T) {
 	n, err := r.Read(buf)
 	if err != nil || n != len(msg) {
 		t.Fatalf("n=%d err=%v", n, err)
+	}
+}
+
+func TestReaderEmptyDatagramsUDP(t *testing.T) {
+	recv, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = recv.Close() })
+	send, err := net.DialUDP("udp4", nil, recv.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = send.Close() })
+	deadline := time.Now().Add(5 * time.Second)
+	if err := recv.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := send.SetWriteDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	messages := [][]byte{nil, []byte("x"), nil}
+	for _, msg := range messages {
+		if n, err := send.Write(msg); n != len(msg) || err != nil {
+			t.Fatalf("send: (%d, %v), want (%d, nil)", n, err, len(msg))
+		}
+	}
+	r := fr.NewReader(recv, fr.WithReadUDP())
+	var buf [8]byte
+	for i, msg := range messages {
+		n, err := r.Read(buf[:])
+		if n != len(msg) || err != nil || !bytes.Equal(buf[:n], msg) {
+			t.Fatalf("message %d: (%d, %v), data %q; want %q", i, n, err, buf[:n], msg)
+		}
 	}
 }
 

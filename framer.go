@@ -17,9 +17,12 @@
 //   - Performance contract: hot paths keep runtime validation minimal; callers are
 //     responsible for valid option and buffer usage plus operation-specific retry
 //     after ErrWouldBlock or ErrMore.
-//   - io compatibility: [Reader], [Writer], and [ReadWriter] implement standard io
-//     interfaces and honor [io.Writer] short-write contracts and [io.Reader] buffer
-//     semantics.
+//   - io interfaces: [Reader], [Writer], and [ReadWriter] implement standard io
+//     interfaces. BinaryStream retries follow the documented same-buffer and
+//     same-message rules; progress counts apply to each call.
+//   - Borrowed input: [Decoder] consumes received slices and returns [Chunk]
+//     views without payload copies. [EncodeHeader] writes framing metadata into
+//     caller-owned storage for output with an explicit I/O lifetime.
 //
 // Wire format (stream mode): a 1-byte header followed by optional extended length bytes
 // and then the payload. Let L be payload length in bytes:
@@ -89,11 +92,18 @@ type Reader struct{ fr *framer }
 //
 // In SeqPacket/Datagram mode, WithReadLimit is enforced after one transport
 // read, so an oversized packet may return (n > limit, ErrTooLong); n reports
-// bytes copied from that packet.
+// bytes copied from that packet. A packet read returning (0, nil) completes
+// an empty message.
 //
 // If Read returns ErrWouldBlock or ErrMore after partial stream progress, retry
 // Read on the same Reader instance with the same buffer until the message
 // completes or a terminal error is returned.
+//
+// The count is payload bytes copied during this call. On a stream retry, new
+// bytes are placed after the previously copied prefix in p. Accumulate counts
+// across retries to find the complete message length; a successful finishing
+// call can return zero when an earlier call copied the final bytes with a
+// control signal. A nil error completes one message, including an empty one.
 func (r *Reader) Read(p []byte) (int, error) { return r.fr.read(p) }
 
 // WriteTo writes messages from r to dst until the source reaches EOF or returns
@@ -120,6 +130,8 @@ func (r *Reader) Read(p []byte) (int, error) { return r.fr.read(p) }
 // io.Writer contract. If a packet source returns bytes with an error, that source
 // error is reported after the admitted packet is emitted, even if write-side
 // suspension requires a later WriteTo call.
+// A packet source's (0, nil) is an empty message, preserved for framer
+// destinations; zero bytes with a non-nil source error do not form a message.
 //
 // The returned count is bytes written to dst. A rejected oversized packet does
 // not add to the count.
@@ -187,12 +199,12 @@ func (r *Reader) writeToStreamSource(sink writeToSink) (int64, error) {
 		// readStream uses fr.offset internally to write to p[payloadOff:] where
 		// payloadOff = fr.offset - hdrSize. This ensures correct accumulation
 		// across ErrWouldBlock boundaries without losing progress.
-		need := int(fr.length)
 		buf := fr.ensureStreamReadBuffer()
-		if need > cap(buf) {
+		if fr.length > int64(cap(buf)) {
 			// When ReadLimit==0, enforce a conservative cap for WriteTo.
 			return total, ErrTooLong
 		}
+		need := int(fr.length)
 		for {
 			_, e := fr.read(buf[:need])
 			if e != nil {
@@ -244,7 +256,7 @@ func (r *Reader) writeToPacketSource(sink writeToSink) (int64, error) {
 			clearWriteToPending(fr)
 			return total, ErrTooLong
 		}
-		if n > 0 {
+		if n > 0 || err == nil {
 			wn, we, done := emitWriteToMessage(fr, sink, buf[:n], err)
 			total += int64(wn)
 			if done || we != nil {
@@ -274,12 +286,17 @@ type Writer struct{ fr *framer }
 // Datagram modes, Write passes p through as one transport packet and reports
 // io.ErrShortWrite if the destination accepts only a prefix.
 //
-// The returned count is bytes accepted from p; BinaryStream header bytes are not
-// included. In BinaryStream mode, if Write returns ErrWouldBlock or ErrMore,
+// The returned count is bytes accepted from p during this call; BinaryStream
+// header bytes are not included. A successful finishing call can return zero
+// when an earlier call accepted the final payload bytes with a control signal.
+// In BinaryStream mode, if Write returns ErrWouldBlock or ErrMore,
 // retry Write on the same Writer instance with the same message length before
-// starting another message. In packet modes, n == len(p) with ErrWouldBlock or
-// ErrMore means the packet was accepted; do not replay p. If packet-mode Write
-// returns ErrWouldBlock or ErrMore with n == 0, retry with the same packet.
+// starting another message. An empty frame's header may already be written
+// before suspension; retry finishes that frame without another header.
+// In packet modes, n == len(p) && n > 0 with ErrWouldBlock or ErrMore means the
+// packet was accepted; do not replay p. Empty packet output is accepted only
+// with nil error. If packet-mode Write returns ErrWouldBlock or ErrMore with
+// n == 0, retry with the same packet, including an empty one.
 func (w *Writer) Write(p []byte) (int, error) { return w.fr.write(p) }
 
 type writeToSink struct {
@@ -439,10 +456,12 @@ func emitWriteToMessage(fr *framer, sink writeToSink, msg []byte, sourceAfter er
 // ReadFrom reads chunks from src and writes each chunk as a framed message.
 //
 // Semantics:
-//   - Chunk-to-message: each chunk read from src (a successful src.Read call) is encoded
+//   - Chunk-to-message: each positive-length chunk read from src is encoded
 //     as a single framed message and written via w.Write. This is efficient but does not
-//     preserve upstream application message boundaries. For protocols that already preserve
-//     boundaries (SeqPacket/Datagram), this is effectively pass-through.
+//     preserve upstream application message boundaries. SeqPacket/Datagram output
+//     emits each chunk as a packet; it does not identify src as a packet source.
+//     A source (0, nil) returns io.ErrNoProgress without another read or an empty
+//     output message. Use a packet Reader or Forwarder to preserve empty input packets.
 //
 // Non-blocking semantics: if src.Read or the underlying writer returns
 // iox.ErrWouldBlock or iox.ErrMore, ReadFrom returns immediately with the
@@ -510,6 +529,8 @@ func (w *Writer) ReadFrom(src io.Reader) (int64, error) {
 			if after, done := finishReadFromPending(fr); done || after != nil {
 				return total, after
 			}
+		} else if er == nil {
+			return total, io.ErrNoProgress
 		}
 		if er != nil {
 			if er == io.EOF {
@@ -571,6 +592,8 @@ func (w *Writer) readFromPacket(src io.Reader) (int64, error) {
 			if after, done := finishReadFromPending(fr); done || after != nil {
 				return total, after
 			}
+		} else if er == nil {
+			return total, io.ErrNoProgress
 		}
 		if er != nil {
 			if er == io.EOF {
@@ -603,8 +626,9 @@ var (
 
 	// ErrMore reports that the same operation has additional progress to deliver.
 	//
-	// It is not io.EOF and not readiness suspension. Process any returned
-	// progress, then call the same operation again.
+	// It is not io.EOF and does not establish input availability. Process any
+	// returned progress, then resume under the operation's retry contract.
+	// Decoder callers supply unconsumed or later input; they never replay bytes.
 	//
 	// ErrMore is an alias for iox.ErrMore.
 	ErrMore = iox.ErrMore
