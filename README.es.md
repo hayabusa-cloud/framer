@@ -131,7 +131,7 @@ Consulte el [ejemplo de decodificación incremental](codec_example_test.go).
 - `WithProtocol(proto Protocol)`: elige `BinaryStream`, `SeqPacket` o `Datagram` (hay variantes de lectura/escritura).
 - Orden de bytes: `WithByteOrder`, o `WithReadByteOrder` / `WithWriteByteOrder`.
 - `WithReadLimit(n int)`: limita el tamaño máximo de la carga útil al leer; `Reader.Read` lo aplica post-lectura en modos de paquete y puede devolver `n > limit` con `ErrTooLong`.
-- `WithRetryDelay(d time.Duration)`: define la política de `ErrWouldBlock` con progreso cero; un valor negativo devuelve `ErrWouldBlock` de inmediato, cero cede la ejecución y reintenta, y un valor positivo espera `d` antes de reintentar. Si una operación ya transfirió bytes, devuelve el conteo positivo con `ErrWouldBlock` para que el llamador procese el progreso antes de reintentar; opciones relacionadas: `WithNonblock()` / `WithBlock()`.
+- `WithRetryDelay(d time.Duration)`: define la política de `ErrWouldBlock` con progreso cero; un valor negativo devuelve `ErrWouldBlock` de inmediato, cero cede la ejecución y reintenta, y un valor positivo espera `d` antes de reintentar. El progreso positivo en bytes del transporte subyacente evita esta espera; el progreso solo en la cabecera aún puede devolver un conteo de carga útil de cero. Opciones relacionadas: `WithNonblock()` / `WithBlock()`.
 
 Funciones auxiliares de transporte (preajustes):
 - `WithReadTCP` / `WithWriteTCP` (`BinaryStream`, BigEndian en orden de red)
@@ -264,7 +264,7 @@ Por defecto, framer es **no bloqueante** (`WithNonblock()`): devuelve `ErrWouldB
 - `WithBlock()` o `WithRetryDelay(0)`: cede la ejecución (`runtime.Gosched`) y reintenta ante `ErrWouldBlock` con progreso cero
 - `WithRetryDelay(d > 0)`: espera `d` y reintenta ante `ErrWouldBlock` con progreso cero
 - `RetryDelay` negativo (por defecto): devuelve `ErrWouldBlock` de progreso cero inmediatamente
-- Si una lectura o escritura ya transfirió bytes, framer devuelve el conteo positivo con `ErrWouldBlock`; procesa el progreso y reintenta la misma operación según se documenta arriba.
+- La política no espera ante un resultado `ErrWouldBlock` subyacente con progreso positivo en bytes. Los conteos públicos siguen el contrato de cada operación; el progreso solo en la cabecera puede devolver cero. Reanuda la misma operación según se documenta arriba.
 
 `WithNonblock()` desactiva los reintentos would-block de framer. No convierte un transporte bloqueante en uno no bloqueante.
 

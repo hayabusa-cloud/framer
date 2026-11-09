@@ -6,14 +6,16 @@
 //
 // Semantics and design:
 //   - Protocol adaptation: on stream transports such as TCP, framer adds a compact
-//     length prefix and preserves one-message-per-Read/Write. On boundary-preserving
-//     transports such as SCTP, UDP, and WebSocket, framer is pass-through.
+//     length prefix and preserves one message per completed read/write operation.
+//     On boundary-preserving transports such as SCTP, UDP, and WebSocket, framer
+//     is pass-through.
 //   - Packet-mode limit semantics: [Reader.Read] checks [WithReadLimit] after one
 //     transport read; oversized packets may return (n > limit, [ErrTooLong]), where n
 //     is the number of bytes copied from that packet. [Reader.WriteTo] and [Forwarder]
 //     use a sentinel byte to reject oversized packets before forwarding bytes.
 //   - Non-blocking first: [ErrWouldBlock] and [ErrMore] are control-flow signals,
-//     not failures. Hot paths avoid allocations and return promptly.
+//     not failures. Prepared steady-state paths avoid allocations; underlying
+//     transports retain their own blocking behavior.
 //   - Performance contract: hot paths keep runtime validation minimal; callers are
 //     responsible for valid option and buffer usage plus operation-specific retry
 //     after ErrWouldBlock or ErrMore.

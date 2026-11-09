@@ -128,7 +128,7 @@ if err != nil {
 - `WithProtocol(proto Protocol)`：`BinaryStream` / `SeqPacket` / `Datagram` を選択（読み/書き方向別もあり）。
 - バイトオーダ：`WithByteOrder`、または `WithReadByteOrder` / `WithWriteByteOrder`。
 - `WithReadLimit(n int)`：読み取り時の最大ペイロードサイズを制限。`Reader.Read` はパケットモードで読み取り後に判定し、`n > limit` と `ErrTooLong` を返す場合があります。
-- `WithRetryDelay(d time.Duration)`：ゼロ進捗の `ErrWouldBlock` ポリシーを設定します。負値は `ErrWouldBlock` を即時返し、ゼロは実行権を譲って再試行し、正値は `d` だけ待機してから再試行します。操作がすでにバイトを転送している場合は、呼び出し側が進捗を処理してから再試行できるように、正のカウントと `ErrWouldBlock` を返します。関連オプション：`WithNonblock()` / `WithBlock()`。
+- `WithRetryDelay(d time.Duration)`：ゼロ進捗の `ErrWouldBlock` ポリシーを設定します。負値は `ErrWouldBlock` を即時返し、ゼロは実行権を譲って再試行し、正値は `d` だけ待機してから再試行します。下層でバイト転送が進んだ結果にはこの待機を適用しません。ヘッダーだけの進捗では、ペイロードのカウントがゼロの場合もあります。関連オプション：`WithNonblock()` / `WithBlock()`。
 
 トランスポート補助オプション（プリセット）：
 - `WithReadTCP` / `WithWriteTCP`（`BinaryStream`、ネットワークオーダ BigEndian）
@@ -261,7 +261,7 @@ if err != nil {
 - `WithBlock()` または `WithRetryDelay(0)`：ゼロ進捗の `ErrWouldBlock` で実行権を譲り（`runtime.Gosched`）再試行
 - `WithRetryDelay(d > 0)`：ゼロ進捗の `ErrWouldBlock` で `d` だけ待機して再試行
 - `RetryDelay` が負（既定）：ゼロ進捗の `ErrWouldBlock` を即時返す
-- 読み取りまたは書き込みがすでにバイトを転送している場合、framer は正のカウントと `ErrWouldBlock` を返します。進捗を処理し、上記の規則どおり同じ操作を再試行してください。
+- 下層の `ErrWouldBlock` が正のバイト進捗を伴う場合、このポリシーによる待機は行いません。公開カウントは各操作の契約に従い、ヘッダーだけの進捗ではゼロの場合もあります。上記の規則どおり同じ操作を再開してください。
 
 `WithNonblock()` は framer の would-block 再試行を無効にします。下層のブロッキング通信をノンブロッキングには変えません。
 

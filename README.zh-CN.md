@@ -124,7 +124,7 @@ if err != nil {
 - `WithProtocol(proto Protocol)`：选择 `BinaryStream`、`SeqPacket` 或 `Datagram`（读/写方向也有独立选项）。
 - 字节序：`WithByteOrder`，或 `WithReadByteOrder` / `WithWriteByteOrder`。
 - `WithReadLimit(n int)`：限制读取时允许的最大消息载荷；`Reader.Read` 在分组模式中读后检查，可能返回 `n > limit` 与 `ErrTooLong`。
-- `WithRetryDelay(d time.Duration)`：设置零进度 `ErrWouldBlock` 策略；负值立即返回 `ErrWouldBlock`，零值让出执行权并重试，正值等待 `d` 后重试。如果操作已经传输了字节，则返回正计数和 `ErrWouldBlock`，让调用方先处理进度再重试；相关选项：`WithNonblock()` / `WithBlock()`。
+- `WithRetryDelay(d time.Duration)`：设置零进度 `ErrWouldBlock` 策略；负值立即返回 `ErrWouldBlock`，零值让出执行权并重试，正值等待 `d` 后重试。底层已有正的字节进度时不应用此等待策略；仅头部取得进度时，负载计数仍可能为零。相关选项：`WithNonblock()` / `WithBlock()`。
 
 传输辅助选项（便捷预设）：
 - `WithReadTCP` / `WithWriteTCP`（`BinaryStream`，网络序 BigEndian）
@@ -257,7 +257,7 @@ if err != nil {
 - `WithBlock()` 或 `WithRetryDelay(0)`：在零进度 `ErrWouldBlock` 上让出执行权（`runtime.Gosched`）并重试
 - `WithRetryDelay(d > 0)`：在零进度 `ErrWouldBlock` 上等待 `d` 并重试
 - `RetryDelay` 为负（默认）：立即返回零进度 `ErrWouldBlock`
-- 如果读取或写入已经传输了字节，framer 会返回正计数和 `ErrWouldBlock`；先处理该进度，再按上文规则重试同一个操作。
+- 底层 `ErrWouldBlock` 结果伴随正的字节进度时，此策略不会等待。公开计数遵循各操作的计数契约；仅头部取得进度时可能返回零。请按上文规则恢复同一个操作。
 
 `WithNonblock()` 仅关闭 framer 的 would-block 重试，不会将阻塞的底层传输转换为非阻塞传输。
 

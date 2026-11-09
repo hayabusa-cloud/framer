@@ -128,7 +128,7 @@ See the [incremental decoding example](codec_example_test.go).
 - `WithProtocol(proto Protocol)`: choose `BinaryStream`, `SeqPacket`, or `Datagram` (read/write variants available).
 - Byte order: `WithByteOrder`, or `WithReadByteOrder` / `WithWriteByteOrder`.
 - `WithReadLimit(n int)`: cap maximum message payload size when reading; `Reader.Read` enforces it post-read in packet modes and may return `n > limit` with `ErrTooLong`.
-- `WithRetryDelay(d time.Duration)`: configure zero-progress `ErrWouldBlock` policy; a negative value returns `ErrWouldBlock` immediately, zero yields and retries, and a positive value sleeps for `d` before retrying. If an operation already transferred bytes, it returns the positive count with `ErrWouldBlock` so the caller can process progress before retrying; related options: `WithNonblock()` / `WithBlock()`.
+- `WithRetryDelay(d time.Duration)`: configure zero-progress `ErrWouldBlock` policy; a negative value returns `ErrWouldBlock` immediately, zero yields and retries, and a positive value sleeps for `d` before retrying. Positive underlying byte progress bypasses this wait policy; header-only progress can still return a zero payload count. Related options: `WithNonblock()` / `WithBlock()`.
 
 Transport helpers (presets):
 - `WithReadTCP` / `WithWriteTCP` (BinaryStream, network‑order BigEndian)
@@ -261,7 +261,7 @@ By default, framer is **non-blocking** (`WithNonblock()`): `ErrWouldBlock` is re
 - `WithBlock()` or `WithRetryDelay(0)`: yield (`runtime.Gosched`) and retry zero-progress would-block
 - `WithRetryDelay(d > 0)`: sleep `d` and retry zero-progress would-block
 - Negative `RetryDelay` (default): return zero-progress `ErrWouldBlock` immediately
-- If a read or write already transferred bytes, framer returns the positive count with `ErrWouldBlock`; process the progress and retry the same operation as documented above.
+- The policy does not wait on an underlying `ErrWouldBlock` result with positive byte progress. Public counts follow each operation's count contract; header-only progress can return zero. Resume the same operation as documented above.
 
 `WithNonblock()` disables framer's would-block retries. It does not make a blocking underlying transport non-blocking.
 

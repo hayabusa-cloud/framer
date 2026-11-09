@@ -69,9 +69,9 @@ type Options struct {
 	//   - zero: yield (runtime.Gosched) and retry
 	//   - positive: sleep for the duration and retry
 	//
-	// If the underlying read or write transfers bytes before returning
-	// ErrWouldBlock, the operation returns that positive count with ErrWouldBlock
-	// so callers can process progress before retrying.
+	// The policy does not wait on an underlying ErrWouldBlock result with
+	// positive byte progress. Public counts remain operation-specific and can
+	// be zero after header-only progress.
 	RetryDelay time.Duration
 }
 
@@ -139,8 +139,9 @@ func WithReadLimit(limit int) Option {
 // ErrWouldBlock without transferring bytes.
 //
 // A negative duration returns ErrWouldBlock immediately. A zero duration yields
-// and retries. A positive duration sleeps for d before retrying. Positive-progress
-// ErrWouldBlock is returned to the caller with its byte count.
+// and retries. A positive duration sleeps for d before retrying. Positive
+// underlying progress bypasses this wait policy; header-only progress can
+// still have a zero public payload count.
 func WithRetryDelay(d time.Duration) Option {
 	return func(o *Options) { o.RetryDelay = d }
 }
@@ -151,8 +152,8 @@ func WithBlock() Option {
 	return func(o *Options) { o.RetryDelay = 0 }
 }
 
-// WithNonblock forces non-blocking behavior by returning zero-progress
-// ErrWouldBlock immediately.
+// WithNonblock disables framer's retries on zero-progress ErrWouldBlock.
+// It does not change the underlying transport's blocking behavior.
 func WithNonblock() Option {
 	return func(o *Options) { o.RetryDelay = -1 }
 }
