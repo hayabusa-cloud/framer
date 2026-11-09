@@ -2,13 +2,17 @@
 
 .DEFAULT_GOAL := test
 
+BENCH ?= .
+BENCHTIME ?= 100ms
+BENCHCOUNT ?= 10
+
 .PHONY: test
 test:
-	go test -race -covermode=atomic -coverprofile=coverage.out ./...
+	go test -timeout=120s -race -covermode=atomic -coverprofile=coverage.out ./...
 
 .PHONY: bench
 bench:
-	go test -bench=. -benchmem -run=^$$ ./...
+	go test -run='^$$' -bench='$(BENCH)' -benchmem -benchtime=$(BENCHTIME) -count=$(BENCHCOUNT) -cpu=1 -timeout=120s ./...
 
 .PHONY: vet
 vet:
