@@ -30,12 +30,14 @@ const (
 )
 
 type framer struct {
-	rd  io.Reader
-	rbo binary.ByteOrder
-	rpr Protocol
-	wr  io.Writer
-	wbo binary.ByteOrder
-	wpr Protocol
+	rd          io.Reader
+	rbo         binary.ByteOrder
+	rpr         Protocol
+	readLittle  bool
+	wr          io.Writer
+	wbo         binary.ByteOrder
+	wpr         Protocol
+	writeLittle bool
 
 	readLimit int64
 
@@ -86,6 +88,16 @@ func newFramer(r io.Reader, w io.Writer, opts ...Option) *framer {
 
 		retryDelay: o.RetryDelay,
 	}
+	// Determine byte-order semantics once, including native and delegated orders.
+	// Reuse owned header storage so construction needs no separate probe buffer.
+	fr.header[0] = 1
+	if fr.rbo != nil {
+		fr.readLittle = fr.rbo.Uint16(fr.header[:2]) == 1
+	}
+	if fr.wbo != nil {
+		fr.writeLittle = fr.wbo.Uint16(fr.header[:2]) == 1
+	}
+	fr.header[0] = 0
 	return fr
 }
 
@@ -136,10 +148,9 @@ func (fr *framer) waitOnceOnWouldBlock() bool {
 func (fr *framer) readOnce(p []byte) (n int, err error) {
 	for {
 		n, err = fr.rd.Read(p)
-		// Guard against broken Readers that violate the io.Reader contract by
-		// returning (0, nil) on a non-empty buffer. Without this, the stream
-		// state machine can spin indefinitely.
-		if len(p) != 0 && n == 0 && err == nil {
+		// A stream zero/nil result makes no progress; a packet zero/nil
+		// result completes an empty message.
+		if len(p) != 0 && n == 0 && err == nil && !fr.rpr.preserveBoundary() {
 			return 0, io.ErrNoProgress
 		}
 		if n > 0 {
@@ -443,7 +454,7 @@ func (fr *framer) readStream(p []byte) (n int, err error) {
 			fr.length = int64(fr.rbo.Uint16(fr.header[frameHeaderLen : frameHeaderLen+exLen]))
 		} else if exLen == 7 {
 			u64 := fr.rbo.Uint64(fr.header[:])
-			if fr.rbo == binary.LittleEndian {
+			if fr.readLittle {
 				fr.length = int64(u64 >> 8)
 			} else {
 				fr.length = int64(u64 & framePayloadMaxLen56)
@@ -477,8 +488,8 @@ func (fr *framer) readStream(p []byte) (n int, err error) {
 				}
 				break
 			}
-			// Absorb ErrMore during aggregation: more data is available
-			// right now, so keep reading toward the message boundary.
+			// Continue aggregation after positive progress. A subsequent
+			// zero-progress control returns to the caller.
 			if re == ErrMore && rn > 0 {
 				continue
 			}
@@ -521,7 +532,7 @@ func (fr *framer) writeStream(p []byte) (n int, err error) {
 			fr.header[0] = framePayloadMaxLen8Bits + 1
 			fr.wbo.PutUint16(fr.header[frameHeaderLen:frameHeaderLen+exLen], uint16(fr.length))
 		} else {
-			if fr.wbo == binary.LittleEndian {
+			if fr.writeLittle {
 				fr.wbo.PutUint64(fr.header[:], uint64(fr.length)<<8)
 			} else {
 				fr.wbo.PutUint64(fr.header[:], uint64(fr.length&framePayloadMaxLen56))

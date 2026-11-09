@@ -30,13 +30,16 @@ import (
 //
 // Semantics (SeqPacket/Datagram):
 //   - Treats one packet as one message unit per call. Reads one packet from src
-//     and writes one packet to dst.
+//     and writes one message to dst. A source (0, nil) is an empty packet;
+//     zero bytes with a non-nil source error do not form a message.
 //   - If the packet source returns (n > 0, err), ForwardOnce forwards that packet
 //     before reporting err. A final (n > 0, io.EOF) packet is reported as nil
 //     after the packet is forwarded, and the next call reports io.EOF.
 //   - Destination packet writes are atomic: zero-progress ErrWouldBlock or ErrMore
 //     keeps the whole packet pending, while a partial packet write fails with
 //     io.ErrShortWrite rather than retrying a suffix as a second packet.
+//     Empty packet output completes only with nil error. An empty stream frame
+//     can suspend after its header is written; retry finishes that same frame.
 //   - Return counts follow the current ForwardOnce phase documented on
 //     [Forwarder.ForwardOnce].
 //
@@ -176,9 +179,8 @@ func (f *Forwarder) ForwardOnce() (n int, err error) {
 			if cap(f.buf) < readCap {
 				return 0, io.ErrShortBuffer
 			}
-			// Attempt a single packet read. A positive count is a packet source
-			// signal; any accompanying source signal is deferred until after the
-			// packet is emitted.
+			// A positive count or zero/nil completes a packet read. Any source
+			// signal accompanying bytes is deferred until the packet is emitted.
 			rn, re := f.rr.read(f.buf[:readCap])
 			f.got = rn
 			if f.got > acceptedMax {
@@ -217,20 +219,15 @@ func (f *Forwarder) ForwardOnce() (n int, err error) {
 			f.need = f.got
 			f.state = 2
 		} else {
-			// Stream payload read; need is known. Pass the full payload slice on
-			// every call to satisfy the reader's contract (len(p) must equal length).
-			for f.got < f.need {
-				rn, re := f.rr.read(f.buf[:f.need])
-				f.got += rn
-				if re != nil {
-					if re == ErrWouldBlock || re == ErrMore {
-						return rn, re
-					}
-					if re == io.EOF {
-						return f.got, io.ErrUnexpectedEOF
-					}
-					return rn, re
+			// Finish the same read even when got == need: the last payload byte
+			// may have arrived with a control signal before the reader reset.
+			rn, re := f.rr.read(f.buf[:f.need])
+			f.got += rn
+			if re != nil {
+				if re == io.EOF {
+					return f.got, io.ErrUnexpectedEOF
 				}
+				return rn, re
 			}
 			f.state = 2
 		}

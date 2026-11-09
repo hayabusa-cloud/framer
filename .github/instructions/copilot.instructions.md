@@ -22,6 +22,10 @@ The stream wire format is:
 
 One successful `Reader.Read` returns at most one message. One successful
 `Writer.Write` emits exactly one message.
+Non-blocking operations may require multiple calls to reach that completion.
+Byte-order options support consistent big/little-endian implementations,
+including NativeEndian and delegating wrappers; concrete type identity is not
+an endianness witness.
 
 ## Review Threshold
 
@@ -105,6 +109,8 @@ Report only these issue classes:
 - Arbitrary `io.Writer` destinations use byte-suffix retry.
 - Packet-preserving `framer.Writer` destinations retry whole packets only after
   zero-progress `ErrWouldBlock` or `ErrMore`.
+  Empty packets are accepted only with nil error; full-count-plus-control
+  acceptance applies to nonempty packets.
 - Stream `framer.Writer` destinations retry the same in-flight frame.
 - Source errors returned with admitted packet bytes are reported after those
   bytes are emitted.
@@ -113,17 +119,50 @@ Report only these issue classes:
 - Retry must preserve the active constructor: byte suffix, packet-atomic,
   stream-frame, or control-only source frontier. Do not coerce one constructor
   into another.
+- Forwarder must finish the suspended source Read before starting its write
+  phase, even if the previous read copied every payload byte. Byte count alone
+  does not establish the reader's message-boundary reset.
 
 ## Count Contracts
 
 Progress counts are operation-indexed:
 
+- `Reader.Read` counts newly copied payload bytes in this call. Stream retries
+  write after the retained prefix in the same buffer; callers accumulate counts.
+- `Writer.Write` counts newly accepted payload bytes in this call. A finishing
+  stream Read or Write can return `(0, nil)` after a previous full-progress
+  control result.
 - `Reader.WriteTo` counts bytes written to `dst`.
 - `Writer.ReadFrom` counts bytes read from `src` and admitted to the writer
   state.
+  A generic source `(0, nil)` returns `io.ErrNoProgress` without another source
+  read or an empty output message. The output mode does not identify the source
+  as a packet transport.
+- Packet-source `(0, nil)` completes an empty message for Reader and Forwarder;
+  zero bytes with a source error do not form a message.
 - `Forwarder.ForwardOnce` counts the active phase. In packet mode, a rejected
   oversized packet may count bytes read from the source, but those bytes must
   not be counted as forwarded bytes.
+
+## Borrowed BinaryStream Codec
+
+- `Decoder.Decode` consumes wire bytes, including the header, and returns at
+  most one `Chunk` without crossing a message boundary. Advance by consumed
+  bytes before handling the error; never replay them.
+- `Chunk.Data` aliases input with capacity equal to length. The caller keeps
+  its backing valid; the decoder retains no input or payload ownership.
+- `Begin` follows a validated complete header; `End` completes the message.
+  Empty messages emit both flags. Header-only progress may emit no chunk.
+- `ErrMore` means positive progress in an incomplete frame; it does not promise
+  input availability. Empty input returns zero-progress `ErrWouldBlock`.
+- `Finish` succeeds at a boundary and reports `io.ErrUnexpectedEOF` for
+  truncation. Decode after successful Finish returns `io.EOF`. Failures persist
+  until `Reset`, which preserves configuration and does not resynchronize bytes.
+- Zero Decoder uses big endian and the wire maximum. `NewDecoder` accepts nil
+  and standard byte orders only; zero limit means the wire maximum.
+- `EncodeHeader` writes only the shortest 1/3/8-byte header into caller storage.
+  Errors return zero and leave it unchanged. Async users retain header storage
+  through I/O release. Neither codec operation copies payload or waits.
 
 ## Read-Limit Contracts
 
@@ -132,6 +171,8 @@ Progress counts are operation-indexed:
 - `Reader.WriteTo` and `Forwarder.ForwardOnce` use sentinel capacity to reject
   oversized packets before forwarding bytes.
 - Rejected oversized packets must not be forwarded.
+- Stream `Reader.WriteTo` compares the wide declared length with buffer capacity
+  before converting it to platform int.
 
 ## Accepted Low-Level Patterns
 

@@ -13,7 +13,7 @@
 
 ## 概述
 
-许多传输是字节流（TCP、Unix stream、pipe）。一次 `Read` 可能只返回应用消息的一部分，也可能把多个消息拼在一起返回。`framer` 恢复消息边界：在 stream 模式下，一次 `Read` 只返回一条消息的载荷；一次 `Write` 只发送一条（带长度前缀的）消息。
+TCP、Unix stream、pipe 等字节流不保留应用消息边界。Framer 添加长度前缀，使每次完成的读写操作对应一条消息。非阻塞操作可能需要保留状态并调用多次。
 
 - 字节流（TCP、Unix stream、pipe）的消息边界保持。
 - 对天然保留边界的传输（UDP、Unix datagram、WebSocket、SCTP）做透传。
@@ -25,7 +25,7 @@
 - `SeqPacket`（例如 SCTP、WebSocket）：透传；底层已保留边界。
 - `Datagram`（例如 UDP、Unix datagram）：透传；底层已保留边界。
 - 对于 `Reader.Read`，分组模式按设计透传：`WithReadLimit` 在一次接收后检查，超大分组可能返回 `n > limit` 与 `ErrTooLong`；`n` 表示从该分组复制出的字节数。
-- 分组输出路径只会在零进度 `ErrWouldBlock` / `ErrMore` 后重试整个分组；带 `ErrWouldBlock` 或 `ErrMore` 返回的完整分组接纳不会重放，部分分组写入会报告为 `io.ErrShortWrite`。
+- 分组输出路径只会在零进度 `ErrWouldBlock` / `ErrMore` 后重试整个分组；带 `ErrWouldBlock` 或 `ErrMore` 返回的完整非空分组接纳不会重放，部分分组写入会报告为 `io.ErrShortWrite`。
 
 可在构造时通过 `WithProtocol(...)` 选择（读/写方向也有独立选项），或使用传输辅助选项（见“选项”）。
 
@@ -76,33 +76,55 @@ fmt.Printf("got: %q\n", buf[:n])
 
 ## 非阻塞用法
 
-`framer` 默认为非阻塞模式。在事件驱动循环中：
+在 BinaryStream 模式下，将 `r`、完整的 `buf` 和累计计数 `received` 保存在连接状态中。事件循环的每次服务只调用一次：
 
 ```go
-for {
-	n, err := r.Read(buf)
-	if n > 0 {
-		process(buf[:n])
-	}
-	if err != nil {
-		if err == framer.ErrWouldBlock {
-			// 当前无数据；等待可读（epoll、io_uring 等）
-			continue
-		}
-		if err == io.EOF {
-			break
-		}
-		log.Fatal(err)
-	}
+n, err := r.Read(buf)
+received += n
+if err != nil {
+	return err
 }
+process(buf[:received])
+received = 0
 ```
+
+遇到 `ErrWouldBlock` 或 `ErrMore` 时保留这些状态并将控制权交回调度器，按输入就绪情况和工作预算使用同一缓冲区恢复。仅在错误为 nil 时处理完整消息，包括空消息。`n` 只计本次新复制的载荷字节；完成此前进度的调用可能返回零。
+
+## 借用输入的 BinaryStream 编解码器
+
+对已接收到调用方缓冲区中的字节使用 `Decoder`。零值采用大端序和线格式最大长度；
+`NewDecoder(order, limit)` 接受 nil 或标准字节序，零上限表示线格式最大长度。
+
+`Decode(src)` 返回已消费的**线格式字节数**和一个 `Chunk`：`Data` 是容量等于长度的载荷视图，
+`Length` 是完整载荷长度，`Begin`/`End` 标记消息边界。每次调用最多完成当前消息。
+处理结果并按已消费字节数推进输入，不要重放。使用 `Data` 时须保持底层存储有效；
+解码器不保留输入或载荷。
+
+`nil` 表示一条消息结束。`ErrMore` 表示未完成帧取得进展，可能仅消费了头部；
+它不保证已有更多输入。空输入返回 `ErrWouldBlock`，应等待后续输入，不要轮询。
+输入结束时调用 `Finish()` 检测截断。失败会持续到 `Reset()`；重置保留配置，
+但要求从新流或已确定的帧边界开始。
+
+`EncodeHeader` 仅将最短头部写入指定存储，失败时不修改目标。
+两项操作均不复制载荷、不分配堆内存、不等待；调用方负责处理预算和缓冲区生命周期。
+
+```go
+var header [framer.MaxHeaderSize]byte
+n, err := framer.EncodeHeader(header[:], uint64(len(payload)), nil)
+if err != nil {
+    return err
+}
+// 依次发送 header[:n] 和 payload；在 I/O 释放之前保留两者。
+```
+
+参见[增量解码示例](codec_example_test.go)。
 
 ## 选项
 
 - `WithProtocol(proto Protocol)`：选择 `BinaryStream`、`SeqPacket` 或 `Datagram`（读/写方向也有独立选项）。
 - 字节序：`WithByteOrder`，或 `WithReadByteOrder` / `WithWriteByteOrder`。
 - `WithReadLimit(n int)`：限制读取时允许的最大消息载荷；`Reader.Read` 在分组模式中读后检查，可能返回 `n > limit` 与 `ErrTooLong`。
-- `WithRetryDelay(d time.Duration)`：设置零进度 `ErrWouldBlock` 策略；负值立即返回 `ErrWouldBlock`，零值让出执行权并重试，正值等待 `d` 后重试。如果操作已经传输了字节，则返回正计数和 `ErrWouldBlock`，让调用方先处理进度再重试；相关选项：`WithNonblock()` / `WithBlock()`。
+- `WithRetryDelay(d time.Duration)`：设置零进度 `ErrWouldBlock` 策略；负值立即返回 `ErrWouldBlock`，零值让出执行权并重试，正值等待 `d` 后重试。底层已有正的字节进度时不应用此等待策略；仅头部取得进度时，负载计数仍可能为零。相关选项：`WithNonblock()` / `WithBlock()`。
 
 传输辅助选项（便捷预设）：
 - `WithReadTCP` / `WithWriteTCP`（`BinaryStream`，网络序 BigEndian）
@@ -120,8 +142,9 @@ for {
 ### 分组模式说明（`SeqPacket` / `Datagram`）
 
 - 分组模式保留底层边界，不做分片。
+- 分组源的 `(0, nil)` 完成一条空消息；零字节伴随源错误不构成消息。空分组输出仅在返回 `nil` 时被接纳；`(0, ErrWouldBlock)` / `(0, ErrMore)` 仍待重试。
 - `Reader.Read` 在单次分组读取后执行 `WithReadLimit`；传输辅助路径使用一个哨兵字节，在转发字节前拒绝超限分组。
-- 保留分组边界的目标只会在零进度 `ErrWouldBlock` / `ErrMore` 后重试整个分组；带 `ErrWouldBlock` 或 `ErrMore` 返回的完整分组接纳不会重放，部分分组写入是边界失败，并报告为 `io.ErrShortWrite`。
+- 保留分组边界的目标只会在零进度 `ErrWouldBlock` / `ErrMore` 后重试整个分组；带 `ErrWouldBlock` 或 `ErrMore` 返回的完整非空分组接纳不会重放，部分分组写入是边界失败，并报告为 `io.ErrShortWrite`。
 - `Reader.WriteTo` 面向任意 `io.Writer` 时是带后缀恢复的字节复制传输。目标是 `framer.Writer` 时使用目标代数：分组写入器在零进度后重试整个分组，流式写入器重试同一个进行中的帧。
 - 如果分组源返回 `(n > 0, err)`，`Reader.WriteTo` 会先输出已接纳的分组，再报告 `err`；写侧挂起时会把该源信号保留到重试。
 - 进度计数按操作定义：`Reader.Read` 报告复制到 `p` 的字节数，`Reader.WriteTo` 报告写入 `dst` 的字节数，`Writer.ReadFrom` 报告从 `src` 读取并纳入写入器状态的字节数，`Forwarder.ForwardOnce` 报告当前阶段的进度。
@@ -129,9 +152,9 @@ for {
 ### 重试规则
 
 - `ErrWouldBlock` 是就绪挂起，不是失败；如果同一次聚合调用中的先前循环步骤已经推进，聚合路径可能返回正计数。
-- `ErrMore` 表示同一操作还有后续进度；它不是 `io.EOF`，也不是就绪挂起。先处理返回的进度，再次调用同一操作。
+- `ErrMore` 保留活跃操作，不是 EOF，也不保证已有更多输入。处理进度后，按该操作的重试契约和调用方工作预算恢复。
 - `Reader.Read` 在流式模式部分进度后需要使用同一个 `Reader` 和同一个缓冲区重试。
-- `Writer.Write` 在 BinaryStream 挂起后需要使用同一个 `Writer` 和相同消息长度重试；BinaryStream 头部字节不计入 `n`。在分组模式下，`n == len(p)` 且返回 `ErrWouldBlock` 或 `ErrMore` 表示该分组已接纳，不要重放 `p`。
+- `Writer.Write` 在 BinaryStream 挂起后需要使用同一个 `Writer` 和相同消息长度重试；BinaryStream 头部字节不计入 `n`。空帧的头部可能在挂起前已经写出；重试完成同一帧，不重复写头部。在分组模式下，`n == len(p) && n > 0` 且返回 `ErrWouldBlock` 或 `ErrMore` 表示该分组已接纳，不要重放 `p`。
 - `Reader.WriteTo` 需要在同一个 `Reader` 和同一个目标上重试，`Writer.ReadFrom` 需要在同一个 `Writer` 上重试，`Forwarder.ForwardOnce` 需要在同一个 `Forwarder` 上重试。
 
 ### 性能约定
@@ -143,39 +166,41 @@ for {
 
 | Error | 含义 | 调用方动作 |
 |-------|------|-----------|
-| `nil` | 操作成功完成 | 继续；`n` 反映全部进度 |
+| `nil` | 操作成功完成 | 继续；n 表示本次调用的进度 |
 | `io.EOF` | 流结束（不再有消息） | 停止读取；正常终止 |
 | `io.ErrUnexpectedEOF` | 在一条消息中途结束（头部或载荷不完整） | 视为致命错误；可能是损坏或断连 |
 | `io.ErrShortBuffer` | 目标缓冲区不足以容纳载荷 | 使用更大的缓冲区重试 |
 | `io.ErrShortWrite` | 目标 Writer 接受的字节数小于提供值 | 视场景重试或视为致命 |
-| `io.ErrNoProgress` | 底层 Reader 在非空缓冲区上返回了无进度（`n==0, err==nil`） | 视为致命；表示底层 `io.Reader` 实现有问题 |
+| `io.ErrNoProgress` | 流式 Reader 或通用 ReadFrom 源在非空缓冲区上返回 `(0, nil)` | 停止或将重试交给调用方；framer 不对零进度忙轮询 |
 | `framer.ErrWouldBlock` | 当前无法继续推进而不等待 | 稍后重试（在 poll/event 之后）；`n` 可能 >0 |
-| `framer.ErrMore` | 同一操作还有后续进度，区别于 EOF 和就绪挂起 | 处理返回的进度，然后再次调用同一操作 |
+| `framer.ErrMore` | 同一操作还有后续进度，区别于 EOF 和就绪挂起 | 处理进度；按操作的输入和调度契约恢复 |
 | `framer.ErrTooLong` | 消息超过配置限制、传输上限或线格式上限 | 拒绝消息；可能需要终止连接 |
 | `framer.ErrInvalidArgument` | reader/writer 为 nil 或配置非法 | 修正配置 |
 
 ### 结果表
 
+下表中 Reader/Writer 的计数均针对本次调用，并非累计消息长度。跨重试累加计数；nil 可能与 `n == 0` 一起确认此前进度完成。
+
 **`Reader.Read(p []byte) (n int, err error)`**（BinaryStream 模式）
 
 | 条件 | n | err |
 |------|---|-----|
-| 完整交付一条消息 | 载荷长度 | `nil` |
+| 完整交付一条消息 | 本次复制的载荷字节数，可能为 0 | `nil` |
 | `len(p) < 载荷长度` | 0 | `io.ErrShortBuffer` |
 | 载荷超过 ReadLimit | 0 | `ErrTooLong` |
-| 底层返回 `ErrWouldBlock` | 已读取字节数 | `ErrWouldBlock` |
-| 底层返回 more | 已读取字节数 | `ErrMore` |
+| 底层返回 `ErrWouldBlock` | 本次复制的载荷字节数，可能为 0 | `ErrWouldBlock` |
+| 底层返回 more | 本次复制的载荷字节数，可能为 0 | `ErrMore` |
 | 在消息边界处 EOF | 0 | `io.EOF` |
-| 头部/载荷中途 EOF | 已读取字节数 | `io.ErrUnexpectedEOF` |
+| 头部/载荷中途 EOF | 本次复制的载荷字节数，可能为 0 | `io.ErrUnexpectedEOF` |
 
 **`Writer.Write(p []byte) (n int, err error)`**（BinaryStream 模式）
 
 | 条件 | n | err |
 |------|---|-----|
-| 完整发送一条带前缀的消息 | `len(p)` | `nil` |
+| 完整发送一条带前缀的消息 | 本次接纳的载荷字节数，可能为 0 | `nil` |
 | 载荷超过最大值（2^56-1） | 0 | `ErrTooLong` |
-| 底层返回 `ErrWouldBlock` | 已写入的载荷字节数 | `ErrWouldBlock` |
-| 底层返回 more | 已写入的载荷字节数 | `ErrMore` |
+| 底层返回 `ErrWouldBlock` | 本次接纳的载荷字节数，可能为 0 | `ErrWouldBlock` |
+| 底层返回 more | 本次接纳的载荷字节数，可能为 0 | `ErrMore` |
 
 **`Reader.WriteTo(dst io.Writer) (n int64, err error)`**
 
@@ -194,6 +219,7 @@ for {
 | 条件 | n | err |
 |------|---|-----|
 | 直到 src EOF 编码完成 | 从 `src` 读取的总字节数 | `nil` |
+| src 返回 `(0, nil)` | 本次调用此前已接纳的字节数 | `io.ErrNoProgress` |
 | src 返回 `ErrWouldBlock` | 信号前从 `src` 读取的字节数 | `ErrWouldBlock` |
 | src 返回 more | 信号前从 `src` 读取的字节数 | `ErrMore` |
 | 底层 writer 返回 `ErrWouldBlock` | 暂停前从 `src` 读取并纳入的字节数；纯写侧恢复时为 0 | `ErrWouldBlock` |
@@ -203,8 +229,8 @@ for {
 
 | 条件 | n | err |
 |------|---|-----|
-| 完整转发一条消息 | 载荷字节数（写阶段） | `nil` |
-| 分组源返回 `(n > 0, io.EOF)` | 载荷字节数（写阶段） | `nil`（下一次调用返回 `io.EOF`） |
+| 完整转发一条消息 | 本次接纳的载荷字节数，可能为 0 | `nil` |
+| 分组源返回 `(n > 0, io.EOF)` | 本次接纳的载荷字节数，可能为 0 | `nil`（下一次调用返回 `io.EOF`） |
 | 不再有消息 | 0 | `io.EOF` |
 | source 返回 `ErrWouldBlock` | 如果尚未输出分组，则为已读字节数；分组源的 `n > 0` 会先输出并返回载荷字节数（写阶段） | `ErrWouldBlock` |
 | source 返回 more | 如果尚未输出分组，则为已读字节数；分组源的 `n > 0` 会先输出并返回载荷字节数（写阶段） | `ErrMore` |
@@ -218,8 +244,8 @@ for {
 
 | 操作 | 边界行为 | 适用场景 |
 |------|----------|----------|
-| `Reader.Read` | **保留消息边界**：一次调用 = 一条消息 | 应用级按消息处理 |
-| `Writer.Write` | **保留消息边界**：一次调用 = 一条消息 | 应用级按消息发送 |
+| `Reader.Read` | **保留消息边界**：完成一次操作对应一条消息，可能需要重试 | 应用级按消息处理 |
+| `Writer.Write` | **保留消息边界**：完成一次操作对应一条消息，可能需要重试 | 应用级按消息发送 |
 | `Reader.WriteTo` | 面向任意写入器是**字节传输**；已知 `framer` 目标保持分组/帧重试律 | 带后缀恢复的高效批量传输 |
 | `Writer.ReadFrom` | **分块**：`src` 的每个分块编码为一条消息；分组输出只在零进度后重试整个分组 | 高效编码；不保留上游边界 |
 | `Forwarder.ForwardOnce` | **保留消息边界的中继**：解一条、再编码一条 | 需要边界语义的代理/转发 |
@@ -231,9 +257,9 @@ for {
 - `WithBlock()` 或 `WithRetryDelay(0)`：在零进度 `ErrWouldBlock` 上让出执行权（`runtime.Gosched`）并重试
 - `WithRetryDelay(d > 0)`：在零进度 `ErrWouldBlock` 上等待 `d` 并重试
 - `RetryDelay` 为负（默认）：立即返回零进度 `ErrWouldBlock`
-- 如果读取或写入已经传输了字节，framer 会返回正计数和 `ErrWouldBlock`；先处理该进度，再按上文规则重试同一个操作。
+- 底层 `ErrWouldBlock` 结果伴随正的字节进度时，此策略不会等待。公开计数遵循各操作的计数契约；仅头部取得进度时可能返回零。请按上文规则恢复同一个操作。
 
-除非显式配置，否则任何方法都不会隐藏阻塞。
+`WithNonblock()` 仅关闭 framer 的 would-block 重试，不会将阻塞的底层传输转换为非阻塞传输。
 
 `framer` 使用 `code.hybscloud.com/iox` 的控制流信号。`ErrWouldBlock` 和 `ErrMore` 是 `iox` 的别名，可与其他 `iox` 感知组件（`iofd`、`takt`）直接集成。
 
@@ -246,9 +272,9 @@ for {
   - Packet（`SeqPacket`/`Datagram`）：透传字节传输；哨兵容量读取会在转发前拒绝超限分组，`n` 计为写入 `dst` 的字节数。
   - 写侧语义错误 `framer.ErrWouldBlock` / `framer.ErrMore` 会原样传播，并且进度计数反映已写入的字节数；与字节一起返回的分组源错误会在已接纳分组输出后报告。
 
-- `(*Writer).ReadFrom(io.Reader)`：分块到消息；`src` 每次成功 `Read` 的分块会被编码为一条消息并通过 `w.Write` 写出。
+- `(*Writer).ReadFrom(io.Reader)`：分块到消息；`src` 每次 `Read` 得到的非空分块会被编码为一条消息并通过 `w.Write` 写出。
   - 这很高效，但不会保留 src 的应用层消息边界。
-  - 在边界保留协议上，它等价于透传。
+  - 分组输出把每个分块作为一个分组，不据此判定输入协议。源返回 `(0, nil)` 时立即返回 `io.ErrNoProgress`，不输出空消息。
   - 语义错误 `framer.ErrWouldBlock` / `framer.ErrMore` 会原样传播；`n` 计为从 `src` 读取并纳入写入器状态的字节数。
 
 建议：在非阻塞循环中，优先使用带重试策略的 `iox.CopyPolicy`（例如 `PolicyRetry`），以显式处理 `ErrWouldBlock` / `ErrMore`。
@@ -269,19 +295,13 @@ for {
 
 ```go
 fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+```
 
-for {
-	_, err := fwd.ForwardOnce()
-	if err != nil {
-		if err == framer.ErrWouldBlock {
-			continue // 等待 src 可读或 dst 可写
-		}
-		if err == io.EOF {
-			break
-		}
-		log.Fatal(err)
-	}
-}
+只构造一次转发器。后续每次服务使用同一实例，并将控制信号交回调用方：
+
+```go
+_, err := fwd.ForwardOnce()
+return err
 ```
 
 ## 许可证

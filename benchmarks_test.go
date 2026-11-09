@@ -37,7 +37,14 @@ func BenchmarkStreamRead_4KB(b *testing.B) {
 	msg := make([]byte, 4096)
 	// We'll use a pipe to get the wire format.
 	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	b.Cleanup(func() {
+		_ = pr.Close()
+		_ = pw.Close()
+		<-done
+	})
 	go func() {
+		defer close(done)
 		ww := fr.NewWriter(pw)
 		for {
 			_, err := ww.Write(msg)

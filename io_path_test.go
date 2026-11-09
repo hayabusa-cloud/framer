@@ -2133,9 +2133,15 @@ func (w *packetAtomicStepWriter) Write(p []byte) (int, error) {
 
 type packetRecordWriter struct {
 	packets [][]byte
+	blocked error
 }
 
 func (w *packetRecordWriter) Write(p []byte) (int, error) {
+	if w.blocked != nil {
+		err := w.blocked
+		w.blocked = nil
+		return 0, err
+	}
 	packet := append([]byte(nil), p...)
 	w.packets = append(w.packets, packet)
 	return len(p), nil
@@ -3028,5 +3034,231 @@ func TestForwarderPacketDefaultTransferCapRejectsOversize(t *testing.T) {
 	}
 	if dst.Len() != 0 {
 		t.Fatalf("dst len=%d want 0", dst.Len())
+	}
+}
+
+func TestPacketRelayEmptyMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		forward bool
+		proto   fr.Protocol
+		plain   bool
+	}{
+		{name: "WriteTo/bytes", plain: true},
+		{name: "WriteTo/stream", proto: fr.BinaryStream},
+		{name: "WriteTo/packet", proto: fr.SeqPacket},
+		{name: "Forward/stream", forward: true, proto: fr.BinaryStream},
+		{name: "Forward/packet", forward: true, proto: fr.Datagram},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &packetSourceStepReader{steps: []struct {
+				b   []byte
+				err error
+			}{{}, {b: []byte("x")}, {}}}
+			var wire bytes.Buffer
+			packets := &packetRecordWriter{}
+			var dst io.Writer = &wire
+			if !tc.plain && tc.proto != fr.BinaryStream {
+				dst = packets
+			}
+			if tc.forward {
+				fwd := fr.NewForwarder(dst, src, fr.WithReadUDP(), fr.WithWriteProtocol(tc.proto))
+				for i, want := range []int{0, 1, 0} {
+					if n, err := fwd.ForwardOnce(); n != want || err != nil {
+						t.Fatalf("message %d: got (%d, %v), want (%d, nil)", i, n, err, want)
+					}
+				}
+				if n, err := fwd.ForwardOnce(); n != 0 || err != io.EOF {
+					t.Fatalf("end: got (%d, %v), want (0, EOF)", n, err)
+				}
+			} else {
+				if !tc.plain {
+					dst = fr.NewWriter(dst, fr.WithWriteProtocol(tc.proto))
+				}
+				r := fr.NewReader(src, fr.WithReadUDP()).(*fr.Reader)
+				if n, err := r.WriteTo(dst); n != 1 || err != nil {
+					t.Fatalf("WriteTo: got (%d, %v), want (1, nil)", n, err)
+				}
+			}
+			if !tc.plain && tc.proto != fr.BinaryStream {
+				if len(packets.packets) != 3 || len(packets.packets[0]) != 0 || string(packets.packets[1]) != "x" || len(packets.packets[2]) != 0 {
+					t.Fatalf("packets = %q, want [empty x empty]", packets.packets)
+				}
+			} else {
+				want := []byte{0, 1, 'x', 0}
+				if tc.plain {
+					want = []byte("x")
+				}
+				if !bytes.Equal(wire.Bytes(), want) {
+					t.Fatalf("wire = %x, want %x", wire.Bytes(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestPacketRelayEmptyOutputResume(t *testing.T) {
+	for _, forward := range []bool{false, true} {
+		for _, tc := range []struct {
+			name   string
+			proto  fr.Protocol
+			err    error
+			header int
+		}{
+			{name: "packet/wouldblock", proto: fr.SeqPacket, err: iox.ErrWouldBlock},
+			{name: "packet/more", proto: fr.SeqPacket, err: iox.ErrMore},
+			{name: "stream/header-written", proto: fr.BinaryStream, err: iox.ErrWouldBlock, header: 1},
+			{name: "stream/more", proto: fr.BinaryStream, err: iox.ErrMore},
+		} {
+			name := "WriteTo/"
+			if forward {
+				name = "Forward/"
+			}
+			t.Run(name+tc.name, func(t *testing.T) {
+				src := &packetSourceStepReader{steps: []struct {
+					b   []byte
+					err error
+				}{{}, {b: []byte("x"), err: io.EOF}}}
+				packets := &packetRecordWriter{blocked: tc.err}
+				wire := &packetAtomicStepWriter{steps: []struct {
+					n   int
+					err error
+				}{{n: tc.header, err: tc.err}}}
+				var dst io.Writer = packets
+				if tc.proto == fr.BinaryStream {
+					dst = wire
+				}
+				var step func() (int64, error)
+				if forward {
+					fwd := fr.NewForwarder(dst, src, fr.WithReadUDP(), fr.WithWriteProtocol(tc.proto))
+					step = func() (int64, error) { n, err := fwd.ForwardOnce(); return int64(n), err }
+				} else {
+					r := fr.NewReader(src, fr.WithReadUDP()).(*fr.Reader)
+					w := fr.NewWriter(dst, fr.WithWriteProtocol(tc.proto))
+					step = func() (int64, error) { return r.WriteTo(w) }
+				}
+				if n, err := step(); n != 0 || err != tc.err || src.step != 1 {
+					t.Fatalf("suspend: (%d, %v), source reads %d", n, err, src.step)
+				}
+				if len(packets.packets) != 0 || wire.buf.Len() != tc.header {
+					t.Fatalf("suspended output: packets %q, wire %x", packets.packets, wire.buf.Bytes())
+				}
+				if forward {
+					if n, err := step(); n != 0 || err != nil || src.step != 1 {
+						t.Fatalf("empty resume: (%d, %v), source reads %d", n, err, src.step)
+					}
+				}
+				if n, err := step(); n != 1 || err != nil {
+					t.Fatalf("finish: got (%d, %v), want (1, nil)", n, err)
+				}
+				if tc.proto == fr.BinaryStream {
+					if !bytes.Equal(wire.buf.Bytes(), []byte{0, 1, 'x'}) {
+						t.Fatalf("wire = %x, want 000178", wire.buf.Bytes())
+					}
+				} else if len(packets.packets) != 2 || len(packets.packets[0]) != 0 || string(packets.packets[1]) != "x" {
+					t.Fatalf("packets = %q, want [empty x]", packets.packets)
+				}
+			})
+		}
+	}
+}
+
+func TestWriterReadFromNoProgress(t *testing.T) {
+	for _, proto := range []fr.Protocol{fr.BinaryStream, fr.Datagram} {
+		name := "stream"
+		if proto == fr.Datagram {
+			name = "packet"
+		}
+		for _, prefix := range []string{"", "a"} {
+			t.Run(name+"/prefix="+prefix, func(t *testing.T) {
+				src := &packetSourceStepReader{}
+				for _, data := range [][]byte{[]byte(prefix), nil, []byte("x")} {
+					src.steps = append(src.steps, struct {
+						b   []byte
+						err error
+					}{b: data})
+				}
+				if prefix == "" {
+					src.steps = src.steps[1:]
+				}
+				dst := &packetRecordWriter{}
+				w := fr.NewWriter(dst, fr.WithWriteProtocol(proto)).(*fr.Writer)
+				if n, err := w.ReadFrom(src); n != int64(len(prefix)) || err != io.ErrNoProgress || src.step != len(prefix)+1 {
+					t.Fatalf("stall: (%d, %v), source reads %d", n, err, src.step)
+				}
+				if prefix == "" && len(dst.packets) != 0 {
+					t.Fatalf("stall emitted %q", dst.packets)
+				}
+				if n, err := w.ReadFrom(src); n != 1 || err != nil {
+					t.Fatalf("retry: got (%d, %v), want (1, nil)", n, err)
+				}
+				want := []byte(prefix + "x")
+				if proto == fr.BinaryStream {
+					want = []byte{1, 'x'}
+					if prefix != "" {
+						want = append([]byte{1, 'a'}, want...)
+					}
+				} else if len(dst.packets) != len(prefix)+1 {
+					t.Fatalf("packets = %q", dst.packets)
+				}
+				if got := bytes.Join(dst.packets, nil); !bytes.Equal(got, want) {
+					t.Fatalf("output = %x, want %x", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestWriterReadFromNoProgressAfterResume(t *testing.T) {
+	for _, proto := range []fr.Protocol{fr.BinaryStream, fr.Datagram} {
+		src := &packetSourceStepReader{steps: []struct {
+			b   []byte
+			err error
+		}{{b: []byte("x"), err: iox.ErrMore}, {}}}
+		dst := &packetAtomicStepWriter{steps: []struct {
+			n   int
+			err error
+		}{{err: iox.ErrWouldBlock}}}
+		w := fr.NewWriter(dst, fr.WithWriteProtocol(proto)).(*fr.Writer)
+		for i, want := range []struct {
+			n     int64
+			err   error
+			reads int
+		}{
+			{1, iox.ErrWouldBlock, 1},
+			{0, iox.ErrMore, 1},
+			{0, io.ErrNoProgress, 2},
+		} {
+			if n, err := w.ReadFrom(src); n != want.n || err != want.err || src.step != want.reads {
+				t.Fatalf("protocol %d call %d: (%d, %v), reads %d; want (%d, %v), reads %d", proto, i, n, err, src.step, want.n, want.err, want.reads)
+			}
+		}
+		want := []byte("x")
+		if proto == fr.BinaryStream {
+			want = []byte{1, 'x'}
+		}
+		if !bytes.Equal(dst.buf.Bytes(), want) {
+			t.Fatalf("output = %x, want %x", dst.buf.Bytes(), want)
+		}
+	}
+}
+
+func TestReaderWriteToRejectsWideLengths(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		length uint64
+	}{
+		{"wrap32", 1 << 32},
+		{"signbit32", 1 << 31},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var header [8]byte
+			binary.BigEndian.PutUint64(header[:], tc.length)
+			header[0] = 0xff
+			r := fr.NewReader(bytes.NewReader(header[:])).(*fr.Reader)
+			if n, err := r.WriteTo(io.Discard); n != 0 || err != fr.ErrTooLong {
+				t.Fatalf("length %d: (%d, %v), want (0, ErrTooLong)", tc.length, n, err)
+			}
+		})
 	}
 }

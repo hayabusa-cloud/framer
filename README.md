@@ -13,7 +13,7 @@ Scope: message boundary preservation for stream transports.
 
 ## Overview
 
-Many transports are byte streams (TCP, Unix stream, pipes). A single `Read` may return a partial application message, or several messages concatenated. `framer` restores message boundaries: in stream mode, one `Read` returns exactly one message payload, and one `Write` emits exactly one framed message.
+Byte-stream transports such as TCP, Unix streams and pipes do not preserve application message boundaries. Framer adds length prefixes so each completed read/write operation handles one message. A non-blocking operation may require several calls with retained state.
 
 - Message boundary preservation for byte streams (TCP, Unix stream, pipes).
 - Pass-through on boundary-preserving transports (UDP, Unix datagram, WebSocket, SCTP).
@@ -25,7 +25,7 @@ Many transports are byte streams (TCP, Unix stream, pipes). A single `Read` may 
 - `SeqPacket` (e.g., SCTP, WebSocket): pass-through; the transport already preserves boundaries.
 - `Datagram` (e.g., UDP, Unix datagram): pass-through; boundary already preserved.
 - For `Reader.Read`, packet modes are pass-through: `WithReadLimit` is checked after one receive, so an oversized packet may return `n > limit` with `ErrTooLong`; `n` is the bytes copied from that packet.
-- Packet-output paths retry whole packets only after zero-progress `ErrWouldBlock` / `ErrMore`; a fully accepted packet returned with `ErrWouldBlock` or `ErrMore` is not replayed, and partial packet writes are reported as `io.ErrShortWrite`.
+- Packet-output paths retry whole packets only after zero-progress `ErrWouldBlock` / `ErrMore`; a fully accepted nonempty packet returned with `ErrWouldBlock` or `ErrMore` is not replayed, and partial packet writes are reported as `io.ErrShortWrite`.
 
 Select at construction time via `WithProtocol(...)` (read/write variants exist) or via transport helpers (see Options).
 
@@ -76,33 +76,59 @@ fmt.Printf("got: %q\n", buf[:n])
 
 ## Non-blocking usage
 
-`framer` defaults to non-blocking mode. In an event-driven loop:
+For BinaryStream, keep `r`, the full `buf`, and an accumulated `received` count in connection state. Each event-loop service attempt performs one call:
 
 ```go
-for {
-	n, err := r.Read(buf)
-	if n > 0 {
-		process(buf[:n])
-	}
-	if err != nil {
-		if err == framer.ErrWouldBlock {
-			// No data now; wait for readability (epoll, io_uring, etc.)
-			continue
-		}
-		if err == io.EOF {
-			break
-		}
-		log.Fatal(err)
-	}
+n, err := r.Read(buf)
+received += n
+if err != nil {
+	return err
 }
+process(buf[:received])
+received = 0
 ```
+
+On `ErrWouldBlock` or `ErrMore`, retain that state and return control to the scheduler. Resume the same buffer under the input/readiness and work-budget policy. Process the full message only on nil error, including empty messages. `n` counts newly copied payload bytes in this call; a finishing call can return zero.
+
+## Borrowed BinaryStream codec
+
+Use `Decoder` for bytes already received into caller-owned buffers. Its zero
+value selects big endian and the wire maximum; `NewDecoder(order, limit)`
+accepts nil or standard byte orders, with zero limit meaning the wire maximum.
+
+`Decode(src)` returns consumed **wire bytes** and one `Chunk`: `Data` is a
+capacity-capped payload view, `Length` is the full payload length, and
+`Begin`/`End` mark message boundaries. It stops at the current message's end.
+Process the result and advance by consumed bytes; never replay them. Keep the
+backing valid while using `Data`; the decoder retains no input or payload.
+
+`nil` ends one message. `ErrMore` reports incomplete-frame progress, possibly
+header-only; it does not promise more input. Empty input returns
+`ErrWouldBlock`; supply later input instead of polling. Call `Finish()` at
+input end to detect truncation. Failures persist until `Reset()`, which keeps
+configuration and requires a new stream or an established frame boundary.
+
+`EncodeHeader` writes only the shortest header into supplied storage; errors
+leave it unchanged. Both operations avoid payload copies, heap allocation and
+waiting. The caller controls service budgets and buffer lifetimes.
+
+```go
+var header [framer.MaxHeaderSize]byte
+n, err := framer.EncodeHeader(header[:], uint64(len(payload)), nil)
+if err != nil {
+    return err
+}
+// Send header[:n] followed by payload; retain both until I/O releases them.
+```
+
+See the [incremental decoding example](codec_example_test.go).
 
 ## Options
 
 - `WithProtocol(proto Protocol)`: choose `BinaryStream`, `SeqPacket`, or `Datagram` (read/write variants available).
 - Byte order: `WithByteOrder`, or `WithReadByteOrder` / `WithWriteByteOrder`.
 - `WithReadLimit(n int)`: cap maximum message payload size when reading; `Reader.Read` enforces it post-read in packet modes and may return `n > limit` with `ErrTooLong`.
-- `WithRetryDelay(d time.Duration)`: configure zero-progress `ErrWouldBlock` policy; a negative value returns `ErrWouldBlock` immediately, zero yields and retries, and a positive value sleeps for `d` before retrying. If an operation already transferred bytes, it returns the positive count with `ErrWouldBlock` so the caller can process progress before retrying; related options: `WithNonblock()` / `WithBlock()`.
+- `WithRetryDelay(d time.Duration)`: configure zero-progress `ErrWouldBlock` policy; a negative value returns `ErrWouldBlock` immediately, zero yields and retries, and a positive value sleeps for `d` before retrying. Positive underlying byte progress bypasses this wait policy; header-only progress can still return a zero payload count. Related options: `WithNonblock()` / `WithBlock()`.
 
 Transport helpers (presets):
 - `WithReadTCP` / `WithWriteTCP` (BinaryStream, network‑order BigEndian)
@@ -120,8 +146,9 @@ Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 ### Packet mode note (`SeqPacket` / `Datagram`)
 
 - Packet mode preserves transport boundaries and does not split packets.
+- A packet source's `(0, nil)` completes an empty message; zero bytes with a source error do not form a message. Empty packet output is accepted only with `nil`; `(0, ErrWouldBlock)` / `(0, ErrMore)` remains pending.
 - `Reader.Read` enforces `WithReadLimit` after one packet read; transfer helpers use one sentinel byte to reject oversized packets before forwarding bytes.
-- Packet-preserving destinations retry the whole packet only after zero-progress `ErrWouldBlock` / `ErrMore`; a fully accepted packet returned with `ErrWouldBlock` or `ErrMore` is not replayed, and partial packet writes are boundary failures reported as `io.ErrShortWrite`.
+- Packet-preserving destinations retry the whole packet only after zero-progress `ErrWouldBlock` / `ErrMore`; a fully accepted nonempty packet returned with `ErrWouldBlock` or `ErrMore` is not replayed, and partial packet writes are boundary failures reported as `io.ErrShortWrite`.
 - `Reader.WriteTo` to an arbitrary `io.Writer` is a byte-copy transfer with suffix resume. When the destination is a `framer.Writer`, it uses the destination algebra: packet writers retry the whole packet after zero progress, and stream writers retry the same in-flight frame.
 - If a packet source returns `(n > 0, err)`, `Reader.WriteTo` emits the admitted packet before reporting `err`; write-side suspension keeps that source signal pending across retry.
 - Progress counts are operation-indexed: `Reader.Read` reports bytes copied into `p`, `Reader.WriteTo` reports bytes written to `dst`, `Writer.ReadFrom` reports bytes read from `src` and admitted to the writer state, and `Forwarder.ForwardOnce` reports progress in its current phase.
@@ -129,9 +156,9 @@ Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 ### Retry discipline
 
 - `ErrWouldBlock` is readiness suspension, not failure; aggregate helpers may return a positive count when earlier loop steps made progress before suspension.
-- `ErrMore` means the same operation has more progress to deliver; it is not `io.EOF` and not readiness suspension. Process any returned progress, then call the same operation again.
+- `ErrMore` preserves a live operation; it is not EOF and does not establish input availability. Process progress and resume under that operation's retry contract and the caller's work budget.
 - Retry `Reader.Read` after partial stream progress on the same `Reader` with the same buffer.
-- Retry `Writer.Write` after BinaryStream suspension on the same `Writer` with the same message length; BinaryStream header bytes are not included in `n`. In packet modes, `n == len(p)` with `ErrWouldBlock` or `ErrMore` means the packet was accepted, so do not replay `p`.
+- Retry `Writer.Write` after BinaryStream suspension on the same `Writer` with the same message length; BinaryStream header bytes are not included in `n`. An empty frame's header may already be written before suspension; retry finishes the same frame without another header. In packet modes, `n == len(p) && n > 0` with `ErrWouldBlock` or `ErrMore` means the packet was accepted, so do not replay `p`.
 - Retry `Reader.WriteTo` on the same `Reader` and same destination, `Writer.ReadFrom` on the same `Writer`, and `Forwarder.ForwardOnce` on the same `Forwarder`.
 
 ### Performance contract
@@ -143,39 +170,41 @@ Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 
 | Error | Meaning | Caller action |
 |-------|---------|---------------|
-| `nil` | Operation completed successfully | Proceed; `n` reflects full progress |
+| `nil` | Operation completed successfully | Proceed; n reports progress in this call |
 | `io.EOF` | End of stream (no more messages) | Stop reading; normal termination |
 | `io.ErrUnexpectedEOF` | Stream ended mid-message (header or payload incomplete) | Treat as fatal; data corruption or disconnect |
 | `io.ErrShortBuffer` | Destination buffer too small for message payload | Retry with larger buffer |
 | `io.ErrShortWrite` | Destination accepted fewer bytes than provided | Retry or treat as fatal per context |
-| `io.ErrNoProgress` | Underlying Reader made no progress (`n==0, err==nil`) on a non-empty buffer | Treat as fatal; indicates a broken `io.Reader` implementation |
+| `io.ErrNoProgress` | Stream Reader or generic ReadFrom source returned `(0, nil)` on a non-empty buffer | Stop or delegate retry to the owner; framer does not spin on zero progress |
 | `framer.ErrWouldBlock` | No progress possible now without waiting | Retry later (after poll/event); `n` may be >0 |
-| `framer.ErrMore` | Same operation has more progress to deliver, distinct from EOF and readiness suspension | Process returned progress, then call the same operation again |
+| `framer.ErrMore` | Same operation has more progress to deliver, distinct from EOF and readiness suspension | Process progress; resume under the operation's input and scheduling contract |
 | `framer.ErrTooLong` | Message exceeds a configured limit, transfer cap, or wire-format bound | Reject message; possibly fatal |
 | `framer.ErrInvalidArgument` | Nil reader/writer or invalid config | Fix configuration |
 
 ### Outcome tables
 
+Reader/Writer counts below are per call, not cumulative message lengths. Sum counts across retries; nil can finish earlier progress with `n == 0`.
+
 **`Reader.Read(p []byte) (n int, err error)`** (BinaryStream mode)
 
 | Condition | n | err |
 |-----------|---|-----|
-| Complete message delivered | payload length | `nil` |
+| Complete message delivered | payload bytes copied this call; possibly 0 | `nil` |
 | `len(p) < payload length` | 0 | `io.ErrShortBuffer` |
 | Payload exceeds ReadLimit | 0 | `ErrTooLong` |
-| Underlying returns would-block | bytes read so far | `ErrWouldBlock` |
-| Underlying returns more | bytes read so far | `ErrMore` |
+| Underlying returns would-block | payload bytes copied this call; possibly 0 | `ErrWouldBlock` |
+| Underlying returns more | payload bytes copied this call; possibly 0 | `ErrMore` |
 | EOF at message boundary | 0 | `io.EOF` |
-| EOF mid-header or mid-payload | bytes read | `io.ErrUnexpectedEOF` |
+| EOF mid-header or mid-payload | payload bytes copied this call; possibly 0 | `io.ErrUnexpectedEOF` |
 
 **`Writer.Write(p []byte) (n int, err error)`** (BinaryStream mode)
 
 | Condition | n | err |
 |-----------|---|-----|
-| Complete framed message emitted | `len(p)` | `nil` |
+| Complete framed message emitted | payload bytes accepted this call; possibly 0 | `nil` |
 | Payload exceeds max (2^56-1) | 0 | `ErrTooLong` |
-| Underlying returns would-block | payload bytes written so far | `ErrWouldBlock` |
-| Underlying returns more | payload bytes written so far | `ErrMore` |
+| Underlying returns would-block | payload bytes accepted this call; possibly 0 | `ErrWouldBlock` |
+| Underlying returns more | payload bytes accepted this call; possibly 0 | `ErrMore` |
 
 **`Reader.WriteTo(dst io.Writer) (n int64, err error)`**
 
@@ -194,6 +223,7 @@ Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 | Condition | n | err |
 |-----------|---|-----|
 | All chunks encoded until src EOF | total bytes read from src | `nil` |
+| src returns `(0, nil)` | bytes admitted earlier in this call | `io.ErrNoProgress` |
 | src returns would-block | bytes read from src before the signal | `ErrWouldBlock` |
 | src returns more | bytes read from src before the signal | `ErrMore` |
 | Underlying writer returns would-block | bytes read from src and admitted before suspension; 0 on pure write-side resume | `ErrWouldBlock` |
@@ -203,8 +233,8 @@ Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 
 | Condition | n | err |
 |-----------|---|-----|
-| One message fully forwarded | payload bytes (write phase) | `nil` |
-| Packet source returns `(n > 0, io.EOF)` | payload bytes (write phase) | `nil` (next call returns `io.EOF`) |
+| One message fully forwarded | payload bytes accepted this call; possibly 0 | `nil` |
+| Packet source returns `(n > 0, io.EOF)` | payload bytes accepted this call; possibly 0 | `nil` (next call returns `io.EOF`) |
 | No more messages | 0 | `io.EOF` |
 | Source returns would-block | read bytes if no packet was emitted; packet-source `n > 0` is emitted first and returns payload bytes (write phase) | `ErrWouldBlock` |
 | Source returns more | read bytes if no packet was emitted; packet-source `n > 0` is emitted first and returns payload bytes (write phase) | `ErrMore` |
@@ -218,8 +248,8 @@ Everything else: see GoDoc: https://pkg.go.dev/code.hybscloud.com/framer
 
 | Operation | Boundary behavior | Use case |
 |-----------|-------------------|----------|
-| `Reader.Read` | **Message-preserving**: one call = one message | Application-level message processing |
-| `Writer.Write` | **Message-preserving**: one call = one framed message | Application-level message sending |
+| `Reader.Read` | **Message-preserving**: one completed operation = one message; retries may be needed | Application-level message processing |
+| `Writer.Write` | **Message-preserving**: one completed operation = one message; retries may be needed | Application-level message sending |
 | `Reader.WriteTo` | **Byte transfer** to arbitrary writers; known `framer` destinations preserve packet/frame retry law | Efficient bulk transfer with suffix resume |
 | `Writer.ReadFrom` | **Chunking**: each src chunk becomes one message; packet output is whole-packet retry only after zero progress | Efficient bulk encoding; does NOT preserve upstream boundaries |
 | `Forwarder.ForwardOnce` | **Message-preserving relay**: decode one, re-encode one | Message-aware proxying with boundary preservation |
@@ -231,9 +261,9 @@ By default, framer is **non-blocking** (`WithNonblock()`): `ErrWouldBlock` is re
 - `WithBlock()` or `WithRetryDelay(0)`: yield (`runtime.Gosched`) and retry zero-progress would-block
 - `WithRetryDelay(d > 0)`: sleep `d` and retry zero-progress would-block
 - Negative `RetryDelay` (default): return zero-progress `ErrWouldBlock` immediately
-- If a read or write already transferred bytes, framer returns the positive count with `ErrWouldBlock`; process the progress and retry the same operation as documented above.
+- The policy does not wait on an underlying `ErrWouldBlock` result with positive byte progress. Public counts follow each operation's count contract; header-only progress can return zero. Resume the same operation as documented above.
 
-No method hides blocking unless explicitly configured.
+`WithNonblock()` disables framer's would-block retries. It does not make a blocking underlying transport non-blocking.
 
 `framer` uses `code.hybscloud.com/iox` control flow signals. `ErrWouldBlock` and `ErrMore` are aliases from `iox`, enabling direct integration with other `iox`-aware components (`iofd`, `takt`).
 
@@ -246,9 +276,9 @@ No method hides blocking unless explicitly configured.
   - Packet (`SeqPacket`/`Datagram`): pass-through byte transfer; sentinel-cap reads reject oversized packets before forwarding, and `n` counts bytes written to `dst`.
   - Semantic write-side errors `framer.ErrWouldBlock` and `framer.ErrMore` are propagated unchanged with the progress count reflecting bytes written; packet-source errors returned with bytes are reported after the admitted packet is emitted.
 
-- `(*Writer).ReadFrom(io.Reader)`: chunk-to-message; each successful `Read` chunk from `src` is encoded as a single framed message.
+- `(*Writer).ReadFrom(io.Reader)`: chunk-to-message; each positive-length `Read` chunk from `src` is encoded as a single framed message.
   - This is efficient but does not preserve application message boundaries from `src`.
-  - On boundary-preserving protocols it effectively behaves like pass-through.
+  - Packet output emits each chunk as one packet; it does not establish the input protocol. A source `(0, nil)` returns `io.ErrNoProgress` immediately without an empty output message.
   - Semantic errors `framer.ErrWouldBlock` and `framer.ErrMore` are propagated unchanged; `n` counts bytes read from `src` and admitted to the writer state.
 
 Recommendation: prefer `iox.CopyPolicy` with a retry-aware policy (e.g., `PolicyRetry`) in non-blocking loops so `ErrWouldBlock` / `ErrMore` are handled explicitly.
@@ -269,19 +299,13 @@ Message relay example:
 
 ```go
 fwd := framer.NewForwarder(dst, src, framer.WithReadTCP(), framer.WithWriteTCP())
+```
 
-for {
-	_, err := fwd.ForwardOnce()
-	if err != nil {
-		if err == framer.ErrWouldBlock {
-			continue // wait for src readable or dst writable
-		}
-		if err == io.EOF {
-			break
-		}
-		log.Fatal(err)
-	}
-}
+Construct the forwarder once. Each later service attempt uses the same instance and returns its control signal to the owner:
+
+```go
+_, err := fwd.ForwardOnce()
+return err
 ```
 
 ## License
