@@ -51,7 +51,8 @@ TCP、Unix stream、pipe 等字节流不保留应用消息边界。Framer 添加
 
 ## 安装
 
-使用 `go get` 安装：
+需要 Go 1.27 或更高版本。
+
 ```shell
 go get code.hybscloud.com/framer
 ```

@@ -1,6 +1,6 @@
 # framer
 
-Portable message framing over Go I/O, with a borrowed-input decoder and caller-owned header encoding. Go 1.26+.
+Portable message framing over Go I/O, with a borrowed-input decoder and caller-owned header encoding. Go 1.27+.
 
 - Preserve the 1/3/8-byte BinaryStream wire format; SeqPacket and Datagram preserve transport boundaries without prefixes.
 - Callers serialize mutable instances and retain buffers through the documented lifetime. Keep progress, completion and buffer ownership distinct.

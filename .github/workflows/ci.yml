@@ -9,25 +9,29 @@ on:
 permissions:
   contents: read
 
+env:
+  GOTOOLCHAIN: local
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   test:
-    name: go test (${{ matrix.os }})
+    # Branch protection uses the original check names for the minimum Go version.
+    name: go test (${{ matrix.os }}${{ matrix.go-version == 'stable' && ', Go stable' || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        go-version: [ '1.26.x' ]
+        go-version: ['1.27.x', 'stable']
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
@@ -39,16 +43,16 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        if: matrix.os != 'ubuntu-latest'
+        if: matrix.os != 'ubuntu-latest' || matrix.go-version == 'stable'
         run: go test -timeout 120s ./... -count=1
 
       - name: Test (with coverage)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27.x'
         run: go test -timeout 120s ./... -count=1 -covermode=atomic -coverprofile=coverage.out
 
       - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-latest'
-        uses: codecov/codecov-action@v6
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.27.x'
+        uses: codecov/codecov-action@v7
         with:
           files: coverage.out
           flags: framer
@@ -68,22 +72,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           cache: true
 
       - name: Go env
-        env:
-          GOOS: ${{ matrix.target.goos }}
-          GOARCH: ${{ matrix.target.goarch }}
-        run: go env GOOS GOARCH
+        run: go env GOVERSION GOOS GOARCH
 
-      - name: Test (native)
-        run: go test -timeout 120s ./... -count=1
+      - name: Test with race detector and examples
+        run: go test -timeout 120s -race -tags examples -count=1 ./...
 
   # Cross-compilation coverage for additional ports (compile only; no runners required).
   cross-compile:
@@ -107,12 +108,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.26.x'
+          go-version: '1.27.x'
           cache: true
 
       - name: Compile test binaries (${{ matrix.target.goos }}/${{ matrix.target.goarch }})
@@ -123,7 +124,7 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
-          go env GOOS GOARCH CGO_ENABLED
+          go env GOVERSION GOOS GOARCH CGO_ENABLED
 
           outdir="$(mktemp -d)"
           ext=""
