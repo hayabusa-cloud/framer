@@ -19,16 +19,22 @@ func BenchmarkDecoder(b *testing.B) {
 		order                binary.ByteOrder
 	}{
 		{"Empty", 0, 1, 1, binary.BigEndian},
+		{"Separate8x32", 32, 33, 8, binary.BigEndian},
+		{"Coalesced8x32", 32, 8 * 33, 8, binary.BigEndian},
 		{"Whole253", 253, 254, 1, binary.BigEndian},
+		{"Whole254", 254, 257, 1, binary.BigEndian},
 		{"Whole4K", 4096, 4099, 1, binary.BigEndian},
+		{"Whole65535", 65535, 65538, 1, binary.BigEndian},
 		{"Whole64K", 65536, 65544, 1, binary.BigEndian},
+		{"Fragment64KIn4K", 65536, 4096, 1, binary.BigEndian},
 		{"LittleEndian4K", 4096, 4099, 1, binary.LittleEndian},
 		{"Fragment64", 4096, 64, 1, binary.BigEndian},
 		{"OneByte", 254, 1, 1, binary.BigEndian},
 		{"Coalesced8x4K", 4096, 8 * 4099, 8, binary.BigEndian},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			frame := codecWire(b, tc.order, benchmarkPayload(tc.size))
+			want := benchmarkPayload(tc.size)
+			frame := codecWire(b, tc.order, want)
 			wire := bytes.Repeat(frame, tc.frames)
 			d, err := fr.NewDecoder(tc.order, 0)
 			if err != nil {
@@ -38,18 +44,21 @@ func BenchmarkDecoder(b *testing.B) {
 			b.SetBytes(int64(tc.size * tc.frames))
 			for b.Loop() {
 				payload, begins, ends := 0, 0, 0
-				for offset := 0; offset < len(wire); {
-					n, chunk, err := d.Decode(wire[offset:min(offset+tc.stride, len(wire))])
-					if n <= 0 || (err != nil && err != fr.ErrMore) || (chunk.End != (err == nil)) {
-						b.Fatalf("Decode: consumed=%d end=%t err=%v", n, chunk.End, err)
-					}
-					offset += n
-					payload += len(chunk.Data)
-					if chunk.Begin {
-						begins++
-					}
-					if chunk.End {
-						ends++
+				for start := 0; start < len(wire); start += tc.stride {
+					input := wire[start:min(start+tc.stride, len(wire))]
+					for len(input) > 0 {
+						n, chunk, err := d.Decode(input)
+						if n <= 0 || n > len(input) || (err != nil && err != fr.ErrMore) || chunk.End != (err == nil) {
+							b.Fatalf("Decode: consumed=%d end=%t err=%v", n, chunk.End, err)
+						}
+						input = input[n:]
+						payload += len(chunk.Data)
+						if chunk.Begin {
+							begins++
+						}
+						if chunk.End {
+							ends++
+						}
 					}
 				}
 				if payload != tc.size*tc.frames || begins != tc.frames || ends != tc.frames {
@@ -59,6 +68,17 @@ func BenchmarkDecoder(b *testing.B) {
 			if err := d.Finish(); err != nil {
 				b.Fatal(err)
 			}
+			d.Reset()
+			messages, err := codecTrace(b, &d, wire, tc.stride)
+			if err != nil || len(messages) != tc.frames {
+				b.Fatalf("decoded %d messages: %v", len(messages), err)
+			}
+			for _, msg := range messages {
+				if !bytes.Equal(msg, want) {
+					b.Fatal("decoded payload differs")
+				}
+			}
+			reportFrames(b, tc.frames)
 		})
 	}
 }

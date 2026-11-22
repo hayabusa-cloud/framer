@@ -3,8 +3,9 @@
 .DEFAULT_GOAL := test
 
 BENCH ?= .
-BENCHTIME ?= 100ms
+BENCHTIME ?= 200ms
 BENCHCOUNT ?= 10
+BENCHCPU ?= 1
 
 .PHONY: test
 test:
@@ -12,7 +13,7 @@ test:
 
 .PHONY: bench
 bench:
-	go test -run='^$$' -bench='$(BENCH)' -benchmem -benchtime=$(BENCHTIME) -count=$(BENCHCOUNT) -cpu=1 -timeout=120s ./...
+	go test -run='^$$' -bench='$(value BENCH)' -benchmem -benchtime=$(BENCHTIME) -count=$(BENCHCOUNT) -cpu=$(BENCHCPU) -timeout=120s ./...
 
 .PHONY: vet
 vet:
