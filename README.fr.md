@@ -1,11 +1,11 @@
 # framer — frontières de messages en E/S de flux
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/framer.svg)](https://pkg.go.dev/code.hybscloud.com/framer)
-[![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/framer)](https://goreportcard.com/report/github.com/hayabusa-cloud/framer)
+[![Benchmarks](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml)
 [![Coverage Status](https://codecov.io/gh/hayabusa-cloud/framer/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/framer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Langues / Languages:** [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [Español](README.es.md) | Français
+**Langues / Languages:** [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [日本語](README.ja.md) | Français
 
 Encapsulation de messages en trames, portable pour Go. Préserve “un message par `Read`/`Write`” au-dessus des transports en flux.
 
@@ -292,6 +292,8 @@ Recommandation : dans les boucles non bloquantes, préférez `iox.CopyPolicy` av
 **Zéro allocation en régime établi** : après l’allocation initiale du tampon, les chemins `Forwarder` et `WriteTo` réutilisent les tampons internes. Aucune allocation sur le tas ne se produit par message en régime établi.
 
 **Note sur la récupération des écritures partielles :** Lors de l'utilisation de `iox.Copy` avec des destinations non bloquantes, des écritures partielles peuvent survenir. Si la source n'implémente pas `io.Seeker`, `iox.Copy` retourne `iox.ErrNoSeeker` pour éviter une perte silencieuse de données. Pour les sources non repositionnables (ex. sockets réseau), utilisez `iox.CopyPolicy` avec `PolicyRetry` pour les erreurs sémantiques côté écriture, afin de garantir que tous les octets lus soient écrits avant le retour.
+
+Le [guide de mesure des performances](BENCHMARKS.md) explique comment mesurer le nombre de trames par seconde, le débit utile et les allocations mémoire avec un ou plusieurs pairs.
 
 ## Relais
 

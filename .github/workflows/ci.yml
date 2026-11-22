@@ -21,6 +21,7 @@ jobs:
     # Branch protection uses the original check names for the minimum Go version.
     name: go test (${{ matrix.os }}${{ matrix.go-version == 'stable' && ', Go stable' || '' }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -62,6 +63,7 @@ jobs:
   native-arch:
     name: go test (native ${{ matrix.target.goos }}/${{ matrix.target.goarch }})
     runs-on: ${{ matrix.target.runsOn }}
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +92,7 @@ jobs:
   cross-compile:
     name: cross-compile (compile tests only)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:

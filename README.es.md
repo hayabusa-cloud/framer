@@ -1,11 +1,11 @@
 # framer — límites de mensaje en E/S de flujo
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/framer.svg)](https://pkg.go.dev/code.hybscloud.com/framer)
-[![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/framer)](https://goreportcard.com/report/github.com/hayabusa-cloud/framer)
+[![Benchmarks](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml)
 [![Coverage Status](https://codecov.io/gh/hayabusa-cloud/framer/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/framer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Idiomas / Languages:** [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | Español | [Français](README.fr.md)
+**Idiomas / Languages:** [English](README.md) | [简体中文](README.zh-CN.md) | Español | [日本語](README.ja.md) | [Français](README.fr.md)
 
 Enmarcado de mensajes portable para Go. Conserva “un mensaje por `Read`/`Write`” sobre transportes de flujo.
 
@@ -290,6 +290,8 @@ Recomendación: en bucles no bloqueantes, prefiere `iox.CopyPolicy` con polític
 **Cero asignaciones en estado estable**: Tras la asignación inicial del búfer, las rutas de `Forwarder` y `WriteTo` reutilizan los búferes internos. No se producen asignaciones en el heap por mensaje en estado estable.
 
 **Nota sobre recuperación de escrituras parciales:** Al usar `iox.Copy` con destinos no bloqueantes, pueden ocurrir escrituras parciales. Si la fuente no implementa `io.Seeker`, `iox.Copy` devuelve `iox.ErrNoSeeker` para evitar pérdida silenciosa de datos. Para fuentes no buscables (p. ej., sockets de red), usa `iox.CopyPolicy` con `PolicyRetry` para errores semánticos del lado de escritura, asegurando que todos los bytes leídos se escriban antes de retornar.
+
+La [guía de pruebas de rendimiento](BENCHMARKS.md) explica cómo medir las tramas por segundo, el caudal de datos útiles y las asignaciones de memoria con uno o varios pares.
 
 ## Reenvío
 

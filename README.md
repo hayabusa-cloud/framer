@@ -1,11 +1,11 @@
 # framer — message boundaries over stream I/O
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/framer.svg)](https://pkg.go.dev/code.hybscloud.com/framer)
-[![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/framer)](https://goreportcard.com/report/github.com/hayabusa-cloud/framer)
+[![Benchmarks](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml)
 [![Coverage Status](https://codecov.io/gh/hayabusa-cloud/framer/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/framer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Languages:** English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Français](README.fr.md)
+**Languages:** English | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [日本語](README.ja.md) | [Français](README.fr.md)
 
 Portable message framing for Go. Preserve one-message-per-Read/Write over stream transports.
 
@@ -287,6 +287,8 @@ Recommendation: prefer `iox.CopyPolicy` with a retry-aware policy (e.g., `Policy
 **Zero-allocation steady state**: After initial buffer allocation, `Forwarder` and `WriteTo` paths reuse internal buffers. No heap allocations occur per message in steady state.
 
 **Note on partial write recovery:** When using `iox.Copy` with non-blocking destinations, partial writes may occur. If the source does not implement `io.Seeker`, `iox.Copy` returns `iox.ErrNoSeeker` to prevent silent data loss. For non-seekable sources (e.g., network sockets), use `iox.CopyPolicy` with `PolicyRetry` for write-side semantic errors to ensure all read bytes are written before returning.
+
+The [benchmark guide](BENCHMARKS.md) shows how to measure frame rate, payload throughput and allocations for one or many peers.
 
 ## Forwarding
 

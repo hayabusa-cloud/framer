@@ -1,11 +1,11 @@
 # framer — ストリーム I/O 上のメッセージ境界
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/framer.svg)](https://pkg.go.dev/code.hybscloud.com/framer)
-[![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/framer)](https://goreportcard.com/report/github.com/hayabusa-cloud/framer)
+[![Benchmarks](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml)
 [![Coverage Status](https://codecov.io/gh/hayabusa-cloud/framer/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/framer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**言語 / Languages:** [English](README.md) | [简体中文](README.zh-CN.md) | 日本語 | [Español](README.es.md) | [Français](README.fr.md)
+**言語 / Languages:** [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | 日本語 | [Français](README.fr.md)
 
 Go 向けのポータブルなメッセージ・フレーミング。ストリーム系トランスポート上で「1 回の `Read` / `Write` = 1 メッセージ」を保ちます。
 
@@ -287,6 +287,8 @@ if err != nil {
 **定常経路での割り当て 0**：初回のバッファ確保後、`Forwarder` と `WriteTo` パスは内部バッファを再利用します。定常状態ではメッセージあたりのヒープ割り当ては発生しません。
 
 **部分書き込みの回復に関する注意：** ノンブロッキングな宛先に対して `iox.Copy` を使用すると、部分書き込みが発生する可能性があります。ソースが `io.Seeker` を実装していない場合、`iox.Copy` はデータの暗黙的な損失を防ぐために `iox.ErrNoSeeker` を返します。シーク不可能なソース（例：ネットワークソケット）の場合は、書き込み側のセマンティックエラーに対して `PolicyRetry` を設定した `iox.CopyPolicy` を使用し、読み取ったすべてのバイトが返却前に書き込まれることを保証してください。
+
+[ベンチマークガイド](BENCHMARKS.md)では、接続先が 1 つの場合と複数の場合について、フレーム処理速度、ペイロードのスループット、メモリ割り当てを測定する方法を説明します。
 
 ## 転送
 
