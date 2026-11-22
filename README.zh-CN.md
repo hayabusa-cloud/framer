@@ -1,11 +1,11 @@
 # framer — 在流式 I/O 上保留消息边界
 
 [![Go Reference](https://pkg.go.dev/badge/code.hybscloud.com/framer.svg)](https://pkg.go.dev/code.hybscloud.com/framer)
-[![Go Report Card](https://goreportcard.com/badge/github.com/hayabusa-cloud/framer)](https://goreportcard.com/report/github.com/hayabusa-cloud/framer)
+[![Benchmarks](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/hayabusa-cloud/framer/actions/workflows/benchmarks.yml)
 [![Coverage Status](https://codecov.io/gh/hayabusa-cloud/framer/graph/badge.svg)](https://codecov.io/gh/hayabusa-cloud/framer)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**语言 / Languages:** [English](README.md) | 简体中文 | [日本語](README.ja.md) | [Español](README.es.md) | [Français](README.fr.md)
+**语言 / Languages:** [English](README.md) | 简体中文 | [Español](README.es.md) | [日本語](README.ja.md) | [Français](README.fr.md)
 
 用于 Go 的可移植消息分帧库。在流式传输上实现“一次 `Read` / `Write` 对应一条消息”。
 
@@ -283,6 +283,8 @@ if err != nil {
 **稳态零分配**：在初始缓冲区分配之后，`Forwarder` 和 `WriteTo` 路径复用内部缓冲区。稳态下每条消息不产生堆分配。
 
 **关于部分写入恢复的说明：** 当使用 `iox.Copy` 向非阻塞目标复制时，可能会发生部分写入。如果源不实现 `io.Seeker`，`iox.Copy` 会返回 `iox.ErrNoSeeker` 以防止静默数据丢失。对于不可寻址的源（如网络套接字），请使用 `iox.CopyPolicy` 并为写入端语义错误配置 `PolicyRetry`，以确保所有已读字节在返回前被写入。
+
+[基准测试指南](BENCHMARKS.md)介绍如何测量单个或多个对端的帧处理速率、有效载荷吞吐量和内存分配。
 
 ## 转发
 
