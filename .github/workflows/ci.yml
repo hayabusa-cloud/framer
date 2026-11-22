@@ -125,13 +125,4 @@ jobs:
         run: |
           set -euo pipefail
           go env GOVERSION GOOS GOARCH CGO_ENABLED
-
-          outdir="$(mktemp -d)"
-          ext=""
-          if [ "${GOOS}" = "windows" ]; then ext=".exe"; fi
-
-          # Build (compile only) each package's test binary for the target platform.
-          while IFS= read -r pkg; do
-            name="$(echo "${pkg}" | tr '/.' '__')"
-            go test -c "${pkg}" -o "${outdir}/${name}${ext}"
-          done < <(go list ./...)
+          go test -c -o "$RUNNER_TEMP/" ./...
