@@ -51,7 +51,8 @@ Limits and errors:
 
 ## Installation
 
-Install with `go get`:
+Requires Go 1.27 or later.
+
 ```shell
 go get code.hybscloud.com/framer
 ```

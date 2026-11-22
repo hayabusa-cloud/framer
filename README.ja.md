@@ -51,7 +51,8 @@ TCP、Unix stream、pipe などのバイトストリームはアプリケーシ�
 
 ## インストール
 
-`go get` でインストール：
+Go 1.27 以降が必要です。
+
 ```shell
 go get code.hybscloud.com/framer
 ```

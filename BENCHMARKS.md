@@ -1,6 +1,6 @@
 # Benchmarks
 
-Use Go 1.26+ and record the compiler and platform:
+Use Go 1.27+ and record the compiler and platform:
 
 ```sh
 go version
